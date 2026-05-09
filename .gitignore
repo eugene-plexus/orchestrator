@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.tox/
+.python-version
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Local Claude state ---
+.claude/projects/
+.claude/settings.local.json
+CLAUDE.md
+
+# --- Local config / secrets ---
+config.yaml
+*.local.yaml
+.env
+.env.*
+!.env.example
+
+# --- Codegen working dirs ---
+.codegen-cache/

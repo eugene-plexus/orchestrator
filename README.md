@@ -1,0 +1,92 @@
+# Eugene Plexus — `orchestrator`
+
+[![CI](https://github.com/eugene-plexus/orchestrator/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eugene-plexus/orchestrator/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB.svg)](https://www.python.org)
+
+Front door of [Eugene Plexus](https://github.com/eugene-plexus). Owns the bicameral loop: dispatches each turn to **two** [`hemisphere-driver`](https://github.com/eugene-plexus/hemisphere-driver) instances in parallel (typically configured with different model families), runs the corpus-callosum blend on their outputs, decides terminate or another pass, and returns the final response.
+
+## Status
+
+**v0.1, working bicameral loop.** Calls two configured hemisphere drivers, runs a trivial agreement-based corpus callosum, writes conversation history to in-process memory, and returns blended responses. Streaming (`/v1/chat/stream`) is stubbed pending the UI consumer.
+
+## Wire contract
+
+This service implements the [`orchestrator.yaml`](https://github.com/eugene-plexus/specs/blob/main/openapi/orchestrator.yaml) OpenAPI 3.1 spec from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs). Pydantic models in `src/eugene_plexus_orchestrator/_generated/` are produced via codegen — see [Codegen](#codegen).
+
+Endpoints:
+
+| Method | Path                          | Status      |
+|--------|-------------------------------|-------------|
+| GET    | `/healthz`                    | ✅           |
+| POST   | `/v1/chat`                    | ✅           |
+| POST   | `/v1/chat/stream`             | stub (501)  |
+| GET    | `/v1/conversations/{id}`      | ✅           |
+| GET    | `/v1/admin/hemispheres`       | ✅           |
+| GET    | `/v1/admin/nt-state`          | ✅           |
+| GET    | `/v1/config`                  | ✅           |
+| GET    | `/v1/config/schema`           | ✅           |
+| PATCH  | `/v1/config`                  | ✅           |
+
+## What v0.1 does
+
+- **Two configured hemisphere-driver URLs** (`leftDriverUrl`, `rightDriverUrl`). The orchestrator calls both in parallel for every turn.
+- **Trivial corpus callosum:** agreement = Jaccard similarity of word-sets between the two outputs. Above the configured `agreementThreshold` → terminate; below → another pass; cap at `defaultMaxPasses`.
+- **Trivial blend:** when terminating, picks the longer of the two hemispheres' responses as the final assistant message. (Honest about the lack of a smart blend; deferred until we have data on what real disagreements look like.)
+- **Static neutral NT state.** The endpoint and schema exist so consumers can begin reading NT now; modulation lands in v0.2.
+- **In-process memory.** `Dict[uuid, list[Message]]`. Implements the same shape as the future `memory` component so the swap is mechanical.
+
+## What v0.1 does NOT do
+
+- Streaming (the orchestrator's `/v1/chat/stream` endpoint and the underlying hemisphere-driver streaming both wait on the UI consumer).
+- Drives, sleep consolidation, plasticity, EWC, autonomous thinking, real vector memory / RAG, tool/MCP integration, auth (assumes Tailscale tailnet).
+
+## Running
+
+```bash
+pip install -e ".[dev]"
+python -m eugene_plexus_orchestrator
+```
+
+Default port: `8080`. Configure via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
+
+You'll need two `hemisphere-driver` instances reachable. Typical local dev:
+
+```bash
+# in one shell
+EUGENE_PLEXUS_HD_CONFIG_FILE=./left.yaml python -m eugene_plexus_hemisphere_driver
+# in another
+EUGENE_PLEXUS_HD_CONFIG_FILE=./right.yaml python -m eugene_plexus_hemisphere_driver
+```
+
+…then point `leftDriverUrl` / `rightDriverUrl` at the two ports.
+
+> **v0.1 has no auth.** Deployment assumption: behind a [Tailscale](https://tailscale.com/) tailnet or equivalent network boundary. Anyone reachable on the network can hit any endpoint. Auth lands in v0.2.
+
+## Codegen
+
+Pydantic models for the wire contract are generated from the pinned commit of `eugene-plexus/specs` recorded in [`SPECS_REF`](SPECS_REF):
+
+```bash
+python scripts/codegen.py
+```
+
+The script downloads the specs at the pinned SHA and runs `datamodel-code-generator`. Generated files are committed for reproducibility; CI re-runs codegen and fails on diff.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+ruff check .
+ruff format --check .
+mypy src/
+pytest
+
+python scripts/codegen.py
+git diff --exit-code src/eugene_plexus_orchestrator/_generated/
+```
+
+## License
+
+Apache 2.0 — see [`LICENSE`](LICENSE).
