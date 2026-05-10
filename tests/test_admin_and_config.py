@@ -49,6 +49,31 @@ def test_admin_drivers_503_when_all_down(
     assert response.status_code == 503
 
 
+def test_admin_drivers_probe_reports_unreachable_url(client: TestClient) -> None:
+    """Probe endpoint hits a real URL — pointing at a port nothing
+    is listening on returns ok=200 with `reachable: false`, not a 5xx.
+    The UI's Test button needs structured failure to render the red
+    banner with the error reason."""
+    response = client.post(
+        "/v1/admin/drivers/probe",
+        json={"name": "candidate", "url": "http://127.0.0.1:1"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "candidate"
+    assert body["reachable"] is False
+    assert body["error"]
+
+
+def test_admin_drivers_probe_rejects_invalid_url(client: TestClient) -> None:
+    response = client.post(
+        "/v1/admin/drivers/probe",
+        json={"name": "bad", "url": "not-a-url"},
+    )
+    # DriverEntry.url is `format: uri` -> 422 from Pydantic before reaching the route.
+    assert response.status_code == 422
+
+
 def test_admin_nt_state_returns_neutral_baseline(client: TestClient) -> None:
     response = client.get("/v1/admin/nt-state")
     assert response.status_code == 200

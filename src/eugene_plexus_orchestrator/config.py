@@ -56,13 +56,15 @@ FIELDS: list[ConfigField] = [
         key="drivers",
         label="Drivers",
         description=(
-            "Ordered list of hemisphere-drivers the orchestrator dispatches "
-            "to on every bicameral pass. Each entry is a {name, url} pair: "
-            "name is the operator-supplied label (stamped on every message "
-            "the driver produces and shown in the UI), url is the driver's "
-            "HTTP base. v0.1 expects exactly two entries; v0.2+ generalizes "
-            "to N with backup/failover semantics. Baked into the HTTP "
-            "clients at startup; restart required."
+            "The list of LLM drivers (\"hemispheres\") the orchestrator "
+            "talks to on every chat turn. Each entry has a `name` "
+            "(free-form label, e.g. \"left\" / \"right\" / \"claude\" / "
+            "\"local-llama\" — appears on the UI's tabs and beside that "
+            "driver's outputs) and a `url` (HTTP base of a running "
+            "hemisphere-driver, e.g. `http://127.0.0.1:8081`). v0.1's "
+            "bicameral loop requires exactly two entries; v0.2+ will "
+            "generalize to N with backup/failover. Use the per-row "
+            "`Test` button to verify a URL is reachable before saving."
         ),
         category="topology",
         valueType=ConfigValueType.driver_list,
@@ -72,11 +74,11 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="memoryUrl",
-        label="Memory Service URL",
+        label="Memory service URL",
         description=(
-            "Base URL of the eugene-plexus/memory service. The orchestrator "
-            "delegates conversation persistence here. Restart required so "
-            "the HTTP client picks up the new base URL."
+            "HTTP base of the running `eugene-plexus/memory` service — "
+            "where conversation history is stored and retrieved. v0.1 "
+            "ships an in-process memory backend on port 8083 by default."
         ),
         category="memory",
         valueType=ConfigValueType.url,
@@ -86,8 +88,13 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="port",
-        label="HTTP Port",
-        description="Port to listen on.",
+        label="HTTP port",
+        description=(
+            "Port the *orchestrator itself* listens on. The UI and any "
+            "other chat client connects to this port. Drivers and the "
+            "memory service have their own separate ports — those are "
+            "configured per-component, not here. v0.1 default is 8080."
+        ),
         category="network",
         valueType=ConfigValueType.integer,
         default=8080,
@@ -97,10 +104,12 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="logLevel",
-        label="Log Level",
+        label="Log level",
         description=(
-            "Logging verbosity. Read by uvicorn at startup; restart required "
-            "for the new level to take effect."
+            "How chatty the orchestrator's terminal output is. `DEBUG` "
+            "prints every bicameral pass and per-driver dispatch "
+            "(useful for debugging); `INFO` is the normal level; "
+            "`WARNING` and `ERROR` go progressively quieter."
         ),
         category="logging",
         valueType=ConfigValueType.enum,
@@ -110,10 +119,16 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="defaultMaxPasses",
-        label="Default Max Passes",
+        label="Default max passes",
         description=(
-            "Maximum bicameral passes per turn before the orchestrator forces "
-            "termination regardless of hemisphere disagreement."
+            "Hard cap on how many times the orchestrator will re-prompt "
+            "the hemispheres before giving up and returning a blended "
+            "response anyway. Each \"pass\" sends the conversation to "
+            "every driver in parallel and scores how much they agree; "
+            "if they disagree, another pass runs. Higher values give "
+            "the system more chances to converge on a unified answer at "
+            "the cost of latency and tokens. The chat request can "
+            "override this per-call."
         ),
         category="bicameral",
         valueType=ConfigValueType.integer,
@@ -123,10 +138,14 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="agreementThreshold",
-        label="Agreement Threshold",
+        label="Agreement threshold",
         description=(
-            "Word-set Jaccard similarity above which the corpus callosum "
-            "decides the hemispheres agree and terminates the loop."
+            "How much overlap two driver responses need before the "
+            "orchestrator considers them \"in agreement\" and stops "
+            "looping. Computed as Jaccard similarity over the unique "
+            "words in each response — 0.0 is no overlap at all, 1.0 is "
+            "identical text. Lower values are more permissive (loop "
+            "ends sooner); higher values demand near-identical answers."
         ),
         category="bicameral",
         valueType=ConfigValueType.number,
@@ -136,10 +155,13 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="defaultSystemPrompt",
-        label="Default System Prompt",
+        label="Default system prompt",
         description=(
-            "System prompt used when the chat request doesn't supply its own. "
-            "Establishes Eugene's persona to the underlying LLMs."
+            "Persona/instructions sent to every driver as a `system` "
+            "message at the start of each chat turn. Used unless the "
+            "incoming chat request supplies its own `systemPrompt`. "
+            "This is where Eugene's voice gets established — \"You are "
+            "Eugene…\" — and where you'd add any global instructions."
         ),
         category="persona",
         valueType=ConfigValueType.string,
@@ -147,13 +169,14 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="defaultTemperature",
-        label="Default Temperature",
+        label="Default temperature",
         description=(
-            "Sampling temperature sent to both hemispheres on every "
-            "generate request. v0.1 placeholder: in v0.2+ the NT system "
-            "modulates this per-pass and per-hemisphere from "
-            "neurotransmitter state; this field becomes the unmodulated "
-            "baseline. Read live at request time — no restart needed."
+            "Sampling randomness sent to every driver on every call. "
+            "0 = deterministic / always picks the most likely next "
+            "token. 1 = the model's own default randomness. Higher "
+            "values get more creative / more varied / more unhinged. "
+            "v0.1 sends a static value; v0.2+ will modulate it from "
+            "neurotransmitter state per-pass per-driver."
         ),
         category="generation",
         valueType=ConfigValueType.number,
@@ -163,11 +186,12 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="defaultMaxTokens",
-        label="Default Max Tokens",
+        label="Default max output tokens",
         description=(
-            "Maximum output tokens sent to both hemispheres on every "
-            "generate request. v0.1 placeholder for the future NT "
-            "system. Read live at request time — no restart needed."
+            "Cap on how long a single driver response can be (roughly "
+            "0.75 words per token). 2048 is enough for ~1,500 words of "
+            "output. Bump it for long-form work; keep it low for "
+            "snappier chat. v0.1 placeholder for the future NT system."
         ),
         category="generation",
         valueType=ConfigValueType.integer,
@@ -176,10 +200,12 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="requestTimeoutSeconds",
-        label="Driver Request Timeout",
+        label="Driver request timeout",
         description=(
-            "Maximum seconds to wait for one hemisphere-driver response. "
-            "Baked into both hemisphere HTTP clients at startup; restart required."
+            "How long the orchestrator waits on one driver's response "
+            "before giving up. Counts from the start of the HTTP "
+            "request to the driver, NOT the end of the bicameral loop. "
+            "Bump this if your slowest model needs more time per pass."
         ),
         category="bicameral",
         valueType=ConfigValueType.duration,
