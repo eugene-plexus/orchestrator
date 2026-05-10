@@ -46,20 +46,28 @@ FIELDS: list[ConfigField] = [
     ConfigField(
         key="leftDriverUrl",
         label="Left Hemisphere URL",
-        description="Base URL of the hemisphere-driver instance acting as the left hemisphere.",
+        description=(
+            "Base URL of the hemisphere-driver instance acting as the left "
+            "hemisphere. Baked into the HTTP client at startup; restart required."
+        ),
         category="hemispheres",
         valueType=ConfigValueType.url,
         default="http://127.0.0.1:8081",
         required=True,
+        requiresRestart=True,
     ),
     ConfigField(
         key="rightDriverUrl",
         label="Right Hemisphere URL",
-        description="Base URL of the hemisphere-driver instance acting as the right hemisphere.",
+        description=(
+            "Base URL of the hemisphere-driver instance acting as the right "
+            "hemisphere. Baked into the HTTP client at startup; restart required."
+        ),
         category="hemispheres",
         valueType=ConfigValueType.url,
         default="http://127.0.0.1:8082",
         required=True,
+        requiresRestart=True,
     ),
     ConfigField(
         key="memoryUrl",
@@ -89,11 +97,15 @@ FIELDS: list[ConfigField] = [
     ConfigField(
         key="logLevel",
         label="Log Level",
-        description="Logging verbosity.",
+        description=(
+            "Logging verbosity. Read by uvicorn at startup; restart required "
+            "for the new level to take effect."
+        ),
         category="logging",
         valueType=ConfigValueType.enum,
         default="INFO",
         enumValues=["DEBUG", "INFO", "WARNING", "ERROR"],
+        requiresRestart=True,
     ),
     ConfigField(
         key="defaultMaxPasses",
@@ -135,12 +147,16 @@ FIELDS: list[ConfigField] = [
     ConfigField(
         key="requestTimeoutSeconds",
         label="Driver Request Timeout",
-        description="Maximum seconds to wait for one hemisphere-driver response.",
+        description=(
+            "Maximum seconds to wait for one hemisphere-driver response. "
+            "Baked into both hemisphere HTTP clients at startup; restart required."
+        ),
         category="bicameral",
         valueType=ConfigValueType.duration,
         default=180,
         minimum=5,
         maximum=900,
+        requiresRestart=True,
     ),
 ]
 

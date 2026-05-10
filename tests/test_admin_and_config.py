@@ -79,16 +79,17 @@ def test_config_get_then_patch_round_trip(client: TestClient) -> None:
 
     patch = client.patch(
         "/v1/config",
-        json={"agreementThreshold": 0.75, "logLevel": "DEBUG", "bogus": True},
+        json={"agreementThreshold": 0.75, "defaultMaxPasses": 5, "bogus": True},
     )
     assert patch.status_code == 200
     body = patch.json()
     assert "agreementThreshold" in body["applied"]
-    assert "logLevel" in body["applied"]
+    assert "defaultMaxPasses" in body["applied"]
     rejected_keys = {r["key"] for r in body["rejected"]}
     assert "bogus" in rejected_keys
+    # Both applied fields are read live at request time — no restart needed.
     assert body["requiresRestart"] is False
 
     follow = client.get("/v1/config").json()
     assert follow["agreementThreshold"] == 0.75
-    assert follow["logLevel"] == "DEBUG"
+    assert follow["defaultMaxPasses"] == 5

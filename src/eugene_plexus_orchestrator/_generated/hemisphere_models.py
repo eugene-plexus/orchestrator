@@ -157,71 +157,21 @@ class ConfigValueType(StrEnum):
     duration = 'duration'
 
 
-class ConfigField(BaseModel):
+class ConfigFieldShowWhen(BaseModel):
     """
-    UI-renderable description of a single editable config field.
+    Predicate over another `ConfigField`'s current value. The UI
+    renders the field this is attached to only when the named field
+    equals the given value.
 
     """
 
     key: str = Field(
         ...,
-        description='Stable machine-readable id, dot-separated for grouping\n(e.g. `"adapter.modelId"`).\n',
+        description='`key` of another field in the same `ConfigSchema` to compare\nagainst.\n',
     )
-    label: str = Field(..., description='Human-readable label for the UI.')
-    description: str | None = Field(
-        None, description='One-sentence explanation suitable for non-programmers.'
-    )
-    category: str = Field(
+    equals: Any = Field(
         ...,
-        description='Group key for UI tabbing or sectioning (e.g. `"adapter"`,\n`"logging"`, `"network"`). Mapped to a display label via\n`ConfigSchema.categories`.\n',
-    )
-    valueType: ConfigValueType
-    default: Any | None = Field(
-        None,
-        description='Default value if unset. Type matches `valueType`. Omitted\nfor fields with no default.\n',
-    )
-    enumValues: list[str] | None = Field(
-        None, description='Allowed values when `valueType == enum`.'
-    )
-    sensitive: bool | None = Field(
-        False,
-        description='If true, the value is redacted (`"<redacted>"`) in\n`ConfigDocument` responses but is accepted in\n`ConfigUpdateRequest`. Use for API keys, passwords, etc.\n',
-    )
-    required: bool | None = Field(
-        False,
-        description='If true, the component will refuse to start without this\nfield set (either in config or via env var fallback).\n',
-    )
-    minimum: float | None = Field(
-        None, description='Validation hint for `integer` / `number` fields.'
-    )
-    maximum: float | None = Field(
-        None, description='Validation hint for `integer` / `number` fields.'
-    )
-    pattern: str | None = Field(
-        None, description='Regex validation hint for `string` / `url` / `file_path`.'
-    )
-    requiresRestart: bool | None = Field(
-        False,
-        description='If true, changes to this field via PATCH are accepted and\nstored but do not take effect until the component process\nrestarts. The UI should warn before submitting.\n',
-    )
-
-
-class ConfigSchema(BaseModel):
-    """
-    UI-renderable description of every editable config field this
-    component accepts. Returned by `GET /v1/config/schema`. UIs use
-    this to render a generic config editor without component-specific
-    code.
-
-    """
-
-    component: str = Field(
-        ..., description='Component identifier (e.g. `"hemisphere-driver"`).'
-    )
-    fields: list[ConfigField]
-    categories: dict[str, str] | None = Field(
-        None,
-        description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
+        description="Value the named field must equal for this field to render.\nUntyped — JSON value matching the referenced field's\n`valueType`. Only literal equality is supported in v0.1;\nricher predicates (`oneOf`, `not`, etc.) deferred until a\nreal use case appears.\n",
     )
 
 
@@ -285,6 +235,54 @@ class ConfigUpdateResult(BaseModel):
     pendingRestart: list[str] | None = Field(
         None,
         description='Keys whose new values are stored but not yet active. Subset\nof `applied`. Empty unless `requiresRestart` is true.\n',
+    )
+
+
+class ConfigTestRequest(BaseModel):
+    """
+    Optional override for `POST /v1/config/test`. Same shape as
+    `ConfigUpdateRequest`: keys override the saved config for the
+    duration of the test only. Useful for "Test Connection" UIs where
+    the operator wants to verify a new API key, URL, or model
+    identifier before committing it. Send an empty body (`{}`) to
+    test the saved config as-is.
+
+    """
+
+    overrides: ConfigUpdateRequest | None = None
+
+
+class ConfigTestResult(BaseModel):
+    """
+    Result of a `POST /v1/config/test` invocation. Components decide
+    what "test" means for their own surface: hemisphere-driver runs
+    a minimal `generate()` round-trip; orchestrator probes its
+    configured hemispheres + memory; memory verifies the store
+    backend is reachable.
+
+    """
+
+    ok: bool = Field(
+        ..., description='True iff the test invocation succeeded end-to-end.'
+    )
+    component: str = Field(
+        ...,
+        description='Component identifier (matches `ConfigSchema.component`).\nEchoed for UI clarity when several /v1/config/test responses\nland in the same view.\n',
+    )
+    latencyMs: int = Field(
+        ..., description='Wall-clock time the test took, in milliseconds.'
+    )
+    summary: str | None = Field(
+        None,
+        description='One-line human-readable result summary. Always set when\n`ok` is true; may be set on failure to add context beyond\n`error`.\n',
+    )
+    sampleOutput: str | None = Field(
+        None,
+        description="Brief sample of the data the test produced — e.g. assistant\ntext from a hemisphere-driver `generate()` round-trip. May be\ntruncated to keep the response small. Omitted when there's\nnothing useful to show.\n",
+    )
+    error: str | None = Field(
+        None,
+        description='Human-readable error message. Set when `ok` is false. Should\nbe specific enough that the operator can act on it (e.g.\n`"openaiApiKey rejected: 401 Unauthorized"`).\n',
     )
 
 
@@ -366,6 +364,78 @@ class Conversation(BaseModel):
 
     id: UUID | None = Field(None, description='Server-assigned conversation id.')
     messages: list[Message]
+
+
+class ConfigField(BaseModel):
+    """
+    UI-renderable description of a single editable config field.
+
+    """
+
+    key: str = Field(
+        ...,
+        description='Stable machine-readable id, dot-separated for grouping\n(e.g. `"adapter.modelId"`).\n',
+    )
+    label: str = Field(..., description='Human-readable label for the UI.')
+    description: str | None = Field(
+        None, description='One-sentence explanation suitable for non-programmers.'
+    )
+    category: str = Field(
+        ...,
+        description='Group key for UI tabbing or sectioning (e.g. `"adapter"`,\n`"logging"`, `"network"`). Mapped to a display label via\n`ConfigSchema.categories`.\n',
+    )
+    valueType: ConfigValueType
+    default: Any | None = Field(
+        None,
+        description='Default value if unset. Type matches `valueType`. Omitted\nfor fields with no default.\n',
+    )
+    enumValues: list[str] | None = Field(
+        None, description='Allowed values when `valueType == enum`.'
+    )
+    sensitive: bool | None = Field(
+        False,
+        description='If true, the value is redacted (`"<redacted>"`) in\n`ConfigDocument` responses but is accepted in\n`ConfigUpdateRequest`. Use for API keys, passwords, etc.\n',
+    )
+    required: bool | None = Field(
+        False,
+        description='If true, the component will refuse to start without this\nfield set (either in config or via env var fallback).\n',
+    )
+    minimum: float | None = Field(
+        None, description='Validation hint for `integer` / `number` fields.'
+    )
+    maximum: float | None = Field(
+        None, description='Validation hint for `integer` / `number` fields.'
+    )
+    pattern: str | None = Field(
+        None, description='Regex validation hint for `string` / `url` / `file_path`.'
+    )
+    requiresRestart: bool | None = Field(
+        False,
+        description='If true, changes to this field via PATCH are accepted and\nstored but do not take effect until the component process\nrestarts. The UI should warn before submitting.\n',
+    )
+    showWhen: ConfigFieldShowWhen | None = Field(
+        None,
+        description="Conditional-rendering hint. When set, the UI should only\nrender this field when another field's current value matches\nthe condition. Used to hide adapter-specific fields\n(e.g. `openaiApiKey`) when a different adapter is selected.\nThe component still validates and stores the field\nregardless of UI visibility.\n",
+    )
+
+
+class ConfigSchema(BaseModel):
+    """
+    UI-renderable description of every editable config field this
+    component accepts. Returned by `GET /v1/config/schema`. UIs use
+    this to render a generic config editor without component-specific
+    code.
+
+    """
+
+    component: str = Field(
+        ..., description='Component identifier (e.g. `"hemisphere-driver"`).'
+    )
+    fields: list[ConfigField]
+    categories: dict[str, str] | None = Field(
+        None,
+        description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
+    )
 
 
 class GenerateResponse(BaseModel):
