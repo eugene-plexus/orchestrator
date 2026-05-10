@@ -1,7 +1,8 @@
-"""Admin endpoints: /v1/admin/hemispheres, /v1/admin/nt-state."""
+"""Admin endpoints: /v1/admin/drivers, /v1/admin/nt-state."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
@@ -9,8 +10,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from .._generated.models import (
     BackendKind,
-    HemisphereInfo,
-    HemispherePairInfo,
+    DriverHealth,
+    DriversInfo,
     NTState,
     Problem,
 )
@@ -22,17 +23,16 @@ router = APIRouter(tags=["admin"])
 log = logging.getLogger(__name__)
 
 
-async def _hemisphere_info(client: HemisphereClient, base_url: str) -> HemisphereInfo:
+async def _driver_health(client: HemisphereClient) -> DriverHealth:
+    base_url = client.base_url
     try:
         info = await client.info()
-        # info.backend is hemisphere-driver.yaml's BackendKind; HemisphereInfo
+        # info.backend is hemisphere-driver.yaml's BackendKind; DriverHealth
         # expects orchestrator.yaml's BackendKind. Same wire values, distinct
         # generated classes — bridge via .value.
         backend = BackendKind(info.backend.value)
-        # TODO(specs): HemisphereInfo.url and similar `format: uri` fields make
-        # codegen produce AnyUrl. Fold into the next spec polish PR alongside
-        # the Problem.type fix that already shipped.
-        return HemisphereInfo(
+        return DriverHealth(
+            name=client.name,
             reachable=True,
             url=base_url,  # type: ignore[arg-type]
             backend=backend,
@@ -40,43 +40,50 @@ async def _hemisphere_info(client: HemisphereClient, base_url: str) -> Hemispher
             version=info.version,
         )
     except httpx.HTTPError as e:
-        log.warning("hemisphere %s unreachable: %s", base_url, e)
-        return HemisphereInfo(
+        log.warning("driver %r at %s unreachable: %s", client.name, base_url, e)
+        return DriverHealth(
+            name=client.name,
             reachable=False,
             url=base_url,  # type: ignore[arg-type]
             error=str(e),
         )
 
 
-@router.get("/v1/admin/hemispheres", response_model=HemispherePairInfo)
-async def list_hemispheres(request: Request) -> HemispherePairInfo:
-    left: HemisphereClient = request.app.state.left_driver
-    right: HemisphereClient = request.app.state.right_driver
-    left_url: str = request.app.state.left_driver_url
-    right_url: str = request.app.state.right_driver_url
+@router.get("/v1/admin/drivers", response_model=DriversInfo)
+async def list_drivers(request: Request) -> DriversInfo:
+    drivers: list[HemisphereClient] = request.app.state.drivers
 
-    left_info = await _hemisphere_info(left, left_url)
-    right_info = await _hemisphere_info(right, right_url)
-
-    pair = HemispherePairInfo(left=left_info, right=right_info)
-
-    if not left_info.reachable and not right_info.reachable:
+    if not drivers:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#hemispheres-unreachable",
-                title="Both hemispheres unreachable",
+                type="https://github.com/eugene-plexus/orchestrator#no-drivers-configured",
+                title="No drivers configured",
                 status=503,
                 detail=(
-                    f"Neither hemisphere-driver is reachable. "
-                    f"left={left_url} ({left_info.error}); "
-                    f"right={right_url} ({right_info.error})."
+                    "The orchestrator has no drivers in its `drivers` config. "
+                    "PATCH /v1/config to populate, then restart."
                 ),
                 component="orchestrator",
             ).model_dump(exclude_none=True),
         )
 
-    return pair
+    healths = await asyncio.gather(*[_driver_health(c) for c in drivers])
+
+    if not any(h.reachable for h in healths):
+        summary = "; ".join(f"{h.name}={h.url} ({h.error})" for h in healths)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#drivers-unreachable",
+                title="No drivers reachable",
+                status=503,
+                detail=f"None of the configured drivers are reachable. {summary}",
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        )
+
+    return DriversInfo(drivers=list(healths))
 
 
 @router.get("/v1/admin/nt-state", response_model=NTState)

@@ -1,7 +1,7 @@
 """Pytest fixtures shared across the test suite.
 
 We stub the hemisphere clients before the FastAPI lifespan runs so tests
-never try to reach real URLs. Each test can replace the per-hemisphere
+never try to reach real URLs. Each test can replace the per-driver
 script of canned responses by mutating the fake clients on the app state.
 """
 
@@ -20,7 +20,6 @@ from eugene_plexus_orchestrator._generated.hemisphere_models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
-    Hemisphere,
 )
 from eugene_plexus_orchestrator.app import create_app
 from eugene_plexus_orchestrator.memory import InProcessMemory
@@ -33,11 +32,13 @@ class FakeHemisphereClient:
     def __init__(
         self,
         *,
-        hemisphere: Hemisphere,
+        name: str,
+        base_url: str = "http://fake-driver",
         backend: BackendKind = BackendKind.claude_code_cli,
         model_id: str = "fake-model",
     ):
-        self.hemisphere = hemisphere
+        self.name = name
+        self.base_url = base_url
         self.backend = backend
         self.model_id = model_id
         self.responses: list[str] = []
@@ -51,16 +52,12 @@ class FakeHemisphereClient:
         return DriverInfo(
             backend=self.backend,
             modelId=self.model_id,
-            hemisphere=self.hemisphere,
             version="0.0.0-fake",
         )
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         self.calls.append(request)
-        if not self.responses:
-            text = f"<{self.hemisphere.value} default response>"
-        else:
-            text = self.responses.pop(0)
+        text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
         return GenerateResponse(
             content=text,
             finishReason=FinishReason.stop,
@@ -80,13 +77,16 @@ def settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 def left_fake() -> FakeHemisphereClient:
-    return FakeHemisphereClient(hemisphere=Hemisphere.left)
+    return FakeHemisphereClient(name="left", base_url="http://fake-left")
 
 
 @pytest.fixture
 def right_fake() -> FakeHemisphereClient:
     return FakeHemisphereClient(
-        hemisphere=Hemisphere.right, backend=BackendKind.codex_cli, model_id="fake-gpt"
+        name="right",
+        base_url="http://fake-right",
+        backend=BackendKind.codex_cli,
+        model_id="fake-gpt",
     )
 
 
@@ -97,10 +97,7 @@ def app(
     right_fake: FakeHemisphereClient,
 ) -> FastAPI:
     app = create_app(settings=settings)
-    app.state.left_driver = left_fake
-    app.state.right_driver = right_fake
-    app.state.left_driver_url = "http://fake-left"
-    app.state.right_driver_url = "http://fake-right"
+    app.state.drivers = [left_fake, right_fake]
     app.state.memory = InProcessMemory()
     app.state.memory_url = "in-process"
     return app

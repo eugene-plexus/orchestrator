@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -19,19 +20,25 @@ from .routes import health as health_routes
 from .settings import Settings, load_settings
 
 
-def build_clients(store: ConfigStore) -> tuple[HemisphereClient, HemisphereClient, str, str]:
-    """Construct left + right hemisphere clients from config.
+def build_clients(store: ConfigStore) -> list[HemisphereClient]:
+    """Construct one HemisphereClient per configured driver.
 
-    Returns (left, right, left_url, right_url). The URLs are returned alongside
-    so admin endpoints can include them in HemisphereInfo responses without
-    re-reading config.
+    Reads the `drivers` config field — a list of {name, url} entries — and
+    builds an `HttpHemisphereClient` for each. Order is preserved so the
+    bicameral loop and admin endpoints walk the drivers in the operator's
+    declared order.
     """
-    left_url = str(store.get("leftDriverUrl"))
-    right_url = str(store.get("rightDriverUrl"))
+    raw = store.get("drivers") or []
     timeout = float(store.get("requestTimeoutSeconds") or 180)
-    left = HttpHemisphereClient(base_url=left_url, timeout_seconds=timeout)
-    right = HttpHemisphereClient(base_url=right_url, timeout_seconds=timeout)
-    return left, right, left_url, right_url
+    clients: list[HemisphereClient] = []
+    for entry in raw:
+        # Validation in ConfigStore.apply_patch already enforces shape, but
+        # in-memory config can also be loaded straight from YAML so guard
+        # again here.
+        name = entry["name"]
+        url = entry["url"]
+        clients.append(HttpHemisphereClient(name=name, base_url=url, timeout_seconds=timeout))
+    return clients
 
 
 def build_memory(store: ConfigStore) -> tuple[MemoryClient, str]:
@@ -65,17 +72,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_memory = False
         app.state.memory_url = getattr(app.state, "memory_url", "")
 
-    if not hasattr(app.state, "left_driver") or not hasattr(app.state, "right_driver"):
-        left, right, left_url, right_url = build_clients(store)
-        app.state.left_driver = left
-        app.state.right_driver = right
-        app.state.left_driver_url = left_url
-        app.state.right_driver_url = right_url
+    if not hasattr(app.state, "drivers"):
+        app.state.drivers = build_clients(store)
         owns_clients = True
     else:
         owns_clients = False
-        app.state.left_driver_url = getattr(app.state, "left_driver_url", "")
-        app.state.right_driver_url = getattr(app.state, "right_driver_url", "")
 
     try:
         yield
@@ -83,8 +84,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if owns_memory:
             await app.state.memory.aclose()
         if owns_clients:
-            await app.state.left_driver.aclose()
-            await app.state.right_driver.aclose()
+            for client in app.state.drivers:
+                await client.aclose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -98,6 +99,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.settings = settings
+    # `drivers` is the canonical list of hemisphere clients in declared
+    # order. Tests inject this on `app.state` before the lifespan runs;
+    # the lifespan otherwise builds it from `ConfigStore`.
+    _: Any = app.state  # placate mypy on dynamic state access below
 
     app.include_router(health_routes.router)
     app.include_router(config_routes.router)

@@ -1,8 +1,10 @@
 """HTTP client for talking to a single hemisphere-driver instance.
 
 Implemented as a thin wrapper around an httpx.AsyncClient: one client per
-hemisphere, lifetime managed by the FastAPI lifespan. The orchestrator
-calls both hemispheres in parallel via asyncio.gather.
+driver, lifetime managed by the FastAPI lifespan. The orchestrator calls
+all configured drivers in parallel via asyncio.gather. Each client carries
+the operator-supplied driver `name` so the bicameral loop can stamp it
+onto every emitted message and the admin endpoint can label it.
 """
 
 from __future__ import annotations
@@ -21,6 +23,9 @@ from ._generated.hemisphere_models import (
 class HemisphereClient(Protocol):
     """Contract every hemisphere client implements (real or fake-for-tests)."""
 
+    name: str
+    base_url: str
+
     async def info(self) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
     async def aclose(self) -> None: ...
@@ -32,18 +37,16 @@ class HttpHemisphereClient:
     def __init__(
         self,
         *,
+        name: str,
         base_url: str,
         timeout_seconds: float = 180.0,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
+        self.name = name
+        self.base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
-            base_url=self._base_url,
+            base_url=self.base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
         )
-
-    @property
-    def base_url(self) -> str:
-        return self._base_url
 
     async def info(self) -> DriverInfo:
         response = await self._client.get("/v1/info")

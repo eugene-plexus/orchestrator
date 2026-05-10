@@ -46,8 +46,7 @@ def _build_initial_messages(
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     store: ConfigStore = request.app.state.config_store
     memory: MemoryClient = request.app.state.memory
-    left: HemisphereClient = request.app.state.left_driver
-    right: HemisphereClient = request.app.state.right_driver
+    drivers: list[HemisphereClient] = request.app.state.drivers
 
     try:
         if body.conversationId is not None:
@@ -100,8 +99,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     try:
         outcome = await run_bicameral_loop(
             initial_messages=initial_messages,
-            left=left,
-            right=right,
+            drivers=drivers,
             nt_state=nt_at_start,
             max_passes=max_passes,
             agreement_threshold=agreement_threshold,

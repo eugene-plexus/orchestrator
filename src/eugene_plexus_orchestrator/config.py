@@ -27,7 +27,7 @@ from ._generated.models import (
 REDACTED = "<redacted>"
 
 CATEGORY_LABELS: dict[str, str] = {
-    "hemispheres": "Hemisphere Pair",
+    "topology": "Drivers",
     "memory": "Memory Service",
     "network": "Network",
     "logging": "Logging",
@@ -35,6 +35,14 @@ CATEGORY_LABELS: dict[str, str] = {
     "generation": "Generation Defaults (NT-modulated in v0.2+)",
     "persona": "Persona",
 }
+
+# Default driver topology: the canonical bicameral pair on local ports.
+# Operators rename / re-URL these via PATCH /v1/config; v0.2+ adds N drivers
+# with backup semantics on top of the same shape.
+DEFAULT_DRIVERS: list[dict[str, str]] = [
+    {"name": "left", "url": "http://127.0.0.1:8081"},
+    {"name": "right", "url": "http://127.0.0.1:8082"},
+]
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Eugene, a synthetic consciousness scaffolded by the Eugene Plexus "
@@ -45,28 +53,20 @@ DEFAULT_SYSTEM_PROMPT = (
 
 FIELDS: list[ConfigField] = [
     ConfigField(
-        key="leftDriverUrl",
-        label="Left Hemisphere URL",
+        key="drivers",
+        label="Drivers",
         description=(
-            "Base URL of the hemisphere-driver instance acting as the left "
-            "hemisphere. Baked into the HTTP client at startup; restart required."
+            "Ordered list of hemisphere-drivers the orchestrator dispatches "
+            "to on every bicameral pass. Each entry is a {name, url} pair: "
+            "name is the operator-supplied label (stamped on every message "
+            "the driver produces and shown in the UI), url is the driver's "
+            "HTTP base. v0.1 expects exactly two entries; v0.2+ generalizes "
+            "to N with backup/failover semantics. Baked into the HTTP "
+            "clients at startup; restart required."
         ),
-        category="hemispheres",
-        valueType=ConfigValueType.url,
-        default="http://127.0.0.1:8081",
-        required=True,
-        requiresRestart=True,
-    ),
-    ConfigField(
-        key="rightDriverUrl",
-        label="Right Hemisphere URL",
-        description=(
-            "Base URL of the hemisphere-driver instance acting as the right "
-            "hemisphere. Baked into the HTTP client at startup; restart required."
-        ),
-        category="hemispheres",
-        valueType=ConfigValueType.url,
-        default="http://127.0.0.1:8082",
+        category="topology",
+        valueType=ConfigValueType.driver_list,
+        default=DEFAULT_DRIVERS,
         required=True,
         requiresRestart=True,
     ),
@@ -257,6 +257,26 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         allowed = field.enumValues or []
         if value not in allowed:
             return f"must be one of {allowed}"
+        return None
+
+    if vt == ConfigValueType.driver_list:
+        if not isinstance(value, list):
+            return f"expected list of {{name, url}} entries, got {type(value).__name__}"
+        if not value:
+            return "drivers list must not be empty"
+        seen_names: set[str] = set()
+        for i, entry in enumerate(value):
+            if not isinstance(entry, dict):
+                return f"entry {i}: expected object, got {type(entry).__name__}"
+            name = entry.get("name")
+            url = entry.get("url")
+            if not isinstance(name, str) or not name.strip():
+                return f"entry {i}: `name` must be a non-empty string"
+            if not isinstance(url, str) or not url.strip():
+                return f"entry {i}: `url` must be a non-empty string"
+            if name in seen_names:
+                return f"entry {i}: duplicate driver name {name!r}"
+            seen_names.add(name)
         return None
 
     return f"unsupported valueType: {vt}"

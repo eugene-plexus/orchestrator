@@ -8,41 +8,44 @@ from fastapi.testclient import TestClient
 from tests.conftest import FakeHemisphereClient
 
 
-def test_admin_hemispheres_reports_pair(
+def test_admin_drivers_reports_list(
     client: TestClient,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    response = client.get("/v1/admin/hemispheres")
+    response = client.get("/v1/admin/drivers")
     assert response.status_code == 200
     body = response.json()
-    assert body["left"]["reachable"] is True
-    assert body["left"]["backend"] == "claude_code_cli"
-    assert body["right"]["reachable"] is True
-    assert body["right"]["backend"] == "codex_cli"
+    drivers = body["drivers"]
+    assert [d["name"] for d in drivers] == ["left", "right"]
+    assert drivers[0]["reachable"] is True
+    assert drivers[0]["backend"] == "claude_code_cli"
+    assert drivers[1]["reachable"] is True
+    assert drivers[1]["backend"] == "codex_cli"
 
 
-def test_admin_hemispheres_reports_individual_unreachability(
+def test_admin_drivers_reports_individual_unreachability(
     client: TestClient,
     left_fake: FakeHemisphereClient,
 ) -> None:
     left_fake.info_error = httpx.ConnectError("connection refused")
-    response = client.get("/v1/admin/hemispheres")
+    response = client.get("/v1/admin/drivers")
     assert response.status_code == 200
     body = response.json()
-    assert body["left"]["reachable"] is False
-    assert "connection refused" in body["left"]["error"]
-    assert body["right"]["reachable"] is True
+    drivers = {d["name"]: d for d in body["drivers"]}
+    assert drivers["left"]["reachable"] is False
+    assert "connection refused" in drivers["left"]["error"]
+    assert drivers["right"]["reachable"] is True
 
 
-def test_admin_hemispheres_503_when_both_down(
+def test_admin_drivers_503_when_all_down(
     client: TestClient,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
     left_fake.info_error = httpx.ConnectError("dead")
     right_fake.info_error = httpx.ConnectError("dead")
-    response = client.get("/v1/admin/hemispheres")
+    response = client.get("/v1/admin/drivers")
     assert response.status_code == 503
 
 
@@ -61,8 +64,8 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
     assert body["component"] == "orchestrator"
     keys = {f["key"] for f in body["fields"]}
     expected = {
-        "leftDriverUrl",
-        "rightDriverUrl",
+        "drivers",
+        "memoryUrl",
         "port",
         "logLevel",
         "defaultMaxPasses",
@@ -73,11 +76,20 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
         "requestTimeoutSeconds",
     }
     assert expected.issubset(keys)
+    # The legacy left/right URL fields are gone — replaced by `drivers`.
+    assert "leftDriverUrl" not in keys
+    assert "rightDriverUrl" not in keys
+
+    drivers_field = next(f for f in body["fields"] if f["key"] == "drivers")
+    assert drivers_field["valueType"] == "driver_list"
+    assert drivers_field["requiresRestart"] is True
 
 
 def test_config_get_then_patch_round_trip(client: TestClient) -> None:
     initial = client.get("/v1/config").json()
     assert initial["agreementThreshold"] == 0.5
+    # `drivers` ships with the canonical bicameral pair on local ports.
+    assert [d["name"] for d in initial["drivers"]] == ["left", "right"]
 
     patch = client.patch(
         "/v1/config",
@@ -95,3 +107,53 @@ def test_config_get_then_patch_round_trip(client: TestClient) -> None:
     follow = client.get("/v1/config").json()
     assert follow["agreementThreshold"] == 0.75
     assert follow["defaultMaxPasses"] == 5
+
+
+def test_config_patch_drivers_validates_shape(client: TestClient) -> None:
+    response = client.patch(
+        "/v1/config",
+        json={
+            "drivers": [
+                {"name": "primary", "url": "http://10.0.0.1:8081"},
+                {"name": "secondary", "url": "http://10.0.0.2:8081"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "drivers" in body["applied"]
+    assert body["requiresRestart"] is True
+
+    follow = client.get("/v1/config").json()
+    assert [d["name"] for d in follow["drivers"]] == ["primary", "secondary"]
+
+
+def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
+    response = client.patch(
+        "/v1/config",
+        json={
+            "drivers": [
+                {"name": "ok", "url": "http://1.1.1.1"},
+                {"name": "", "url": "http://2.2.2.2"},  # empty name
+            ]
+        },
+    )
+    assert response.status_code == 200
+    rejected = {r["key"]: r["message"] for r in response.json()["rejected"]}
+    assert "drivers" in rejected
+    assert "name" in rejected["drivers"]
+
+
+def test_config_patch_drivers_rejects_duplicate_names(client: TestClient) -> None:
+    response = client.patch(
+        "/v1/config",
+        json={
+            "drivers": [
+                {"name": "twin", "url": "http://1.1.1.1"},
+                {"name": "twin", "url": "http://2.2.2.2"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    rejected = {r["key"]: r["message"] for r in response.json()["rejected"]}
+    assert "duplicate" in rejected["drivers"].lower()

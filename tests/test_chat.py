@@ -25,6 +25,9 @@ def test_chat_round_trip_when_hemispheres_agree(
     assert len(body["passes"]) == 1
     assert body["passes"][0]["callosum"]["decision"] == "terminate"
     assert body["passes"][0]["callosum"]["agreement"] == 1.0
+    # Hemisphere messages carry the operator-supplied driver name.
+    driver_names = [m["driverName"] for m in body["passes"][0]["hemispheres"]]
+    assert driver_names == ["left", "right"]
 
 
 def test_chat_runs_more_passes_until_agreement(

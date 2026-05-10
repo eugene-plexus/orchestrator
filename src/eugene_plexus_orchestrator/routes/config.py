@@ -44,7 +44,7 @@ async def test_config(
     request: Request,
     body: ConfigTestRequest | None = None,
 ) -> ConfigTestResult:
-    """Probe the configured hemispheres' `/v1/info` and the memory
+    """Probe every configured driver's `/v1/info` and the memory
     service's `/healthz` using saved config + optional overrides.
     Override values are NOT persisted."""
     start = time.perf_counter()
@@ -57,8 +57,7 @@ async def test_config(
     def get(key: str) -> Any:
         return overrides[key] if key in overrides else store.get(key)
 
-    left_url = str(get("leftDriverUrl") or "")
-    right_url = str(get("rightDriverUrl") or "")
+    drivers_raw = get("drivers") or []
     memory_url = str(get("memoryUrl") or "")
     timeout = float(get("requestTimeoutSeconds") or 30)
 
@@ -74,11 +73,15 @@ async def test_config(
             return name, f"{name} ({base_url}{path}) — {e}"
         return name, None
 
-    results = await asyncio.gather(
-        probe("left-hemisphere", left_url, "/v1/info"),
-        probe("right-hemisphere", right_url, "/v1/info"),
-        probe("memory", memory_url, "/healthz"),
-    )
+    probes: list[Any] = [probe("memory", memory_url, "/healthz")]
+    for entry in drivers_raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "<unnamed>")
+        url = str(entry.get("url") or "")
+        probes.append(probe(name, url, "/v1/info"))
+
+    results = await asyncio.gather(*probes)
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     failures = [err for _, err in results if err]
@@ -89,9 +92,10 @@ async def test_config(
             latencyMs=elapsed_ms,
             error="; ".join(failures),
         )
+    driver_count = len(drivers_raw)
     return ConfigTestResult(
         ok=True,
         component="orchestrator",
         latencyMs=elapsed_ms,
-        summary=f"both hemispheres + memory reachable in {elapsed_ms}ms",
+        summary=f"all {driver_count} driver(s) + memory reachable in {elapsed_ms}ms",
     )

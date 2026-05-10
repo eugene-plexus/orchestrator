@@ -42,6 +42,45 @@ class Role(StrEnum):
     hemisphere = 'hemisphere'
 
 
+class Message(BaseModel):
+    """
+    A single message in an Eugene Plexus conversation. The shape is
+    deliberately close to the OpenAI / Anthropic chat message format so
+    that adapters don't have to re-shape on every hop, but `role` includes
+    `hemisphere` for messages emitted by one of the parallel drivers
+    during a bicameral pass (visible to corpus callosum and UI debug
+    views, not normally to the end user).
+
+    """
+
+    role: Role
+    content: str = Field(
+        ...,
+        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+    )
+    driverName: str | None = Field(
+        None,
+        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
+    passIndex: int | None = Field(
+        None,
+        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
+        ge=0,
+    )
+
+
+class Conversation(BaseModel):
+    """
+    An ordered list of messages constituting a conversation history.
+    """
+
+    id: UUID | None = Field(None, description='Server-assigned conversation id.')
+    messages: list[Message]
+
+
 class NTState(BaseModel):
     """
     A snapshot of Eugene's neurotransmitter state. v0.1 wires this through
@@ -88,13 +127,25 @@ class NTState(BaseModel):
     )
 
 
-class Hemisphere(StrEnum):
+class DriverEntry(BaseModel):
     """
-    Which hemisphere of the bicameral pair.
+    One operator-configured hemisphere-driver in the orchestrator's
+    topology. The orchestrator owns the `name` (free-form, used for
+    labelling messages and UI tabs); drivers themselves are anonymous
+    and report only their backend / model identity. v0.1 expects two
+    entries; v0.2+ generalizes to N (with backup/failover semantics
+    layered on top).
+
     """
 
-    left = 'left'
-    right = 'right'
+    name: str = Field(
+        ...,
+        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this driver\nproduces and surfaced in the UI as the tab/column label.\n',
+        min_length=1,
+    )
+    url: AnyUrl = Field(
+        ..., description="Base URL where the driver's HTTP API is reachable."
+    )
 
 
 class BackendKind(StrEnum):
@@ -176,6 +227,7 @@ class ConfigValueType(StrEnum):
     file_path = 'file_path'
     url = 'url'
     duration = 'duration'
+    driver_list = 'driver_list'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -317,13 +369,39 @@ class Decision(StrEnum):
     cap_reached = 'cap_reached'
 
 
-class HemisphereInfo(BaseModel):
+class CallosumState(BaseModel):
+    """
+    Output of the corpus-callosum blend at the end of one bicameral pass.
+    v0.1 implements only a trivial blend (string equality / length-based
+    heuristic); v0.2+ replaces this with a real disagreement signal
+    (semantic similarity, cross-hemisphere critique, etc.).
+
+    """
+
+    agreement: float = Field(
+        ...,
+        description='Estimated agreement between the two hemispheres on this pass.\n1.0 = identical content, 0.0 = orthogonal.\n',
+        ge=0.0,
+        le=1.0,
+    )
+    decision: Decision = Field(
+        ..., description='What the orchestrator did at the end of this pass.'
+    )
+    blendedMessage: Message | None = None
+
+
+class DriverHealth(BaseModel):
     """
     What the orchestrator sees from one hemisphere-driver's `/v1/info`,
-    plus the orchestrator-side reachability status.
+    plus the orchestrator-side reachability status and the
+    operator-supplied `name`.
 
     """
 
+    name: str = Field(
+        ...,
+        description="Operator-supplied driver name from the orchestrator's\n`drivers` config. UI uses this as the tab/column label.\n",
+    )
     reachable: bool
     url: AnyUrl | None = Field(
         None, description='How the orchestrator reaches this driver.'
@@ -332,45 +410,6 @@ class HemisphereInfo(BaseModel):
     modelId: str | None = None
     version: str | None = None
     error: str | None = Field(None, description='Populated when `reachable: false`.')
-
-
-class Message(BaseModel):
-    """
-    A single message in an Eugene Plexus conversation. The shape is
-    deliberately close to the OpenAI / Anthropic chat message format so
-    that adapters don't have to re-shape on every hop, but `role` includes
-    `hemisphere` for messages emitted by an individual hemisphere during
-    the bicameral pass (visible to corpus callosum and UI debug views,
-    not normally to the end user).
-
-    """
-
-    role: Role
-    content: str = Field(
-        ...,
-        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
-    )
-    hemisphere: Hemisphere | None = Field(
-        None,
-        description='When `role == "hemisphere"`, identifies which hemisphere\nproduced this message. Omitted otherwise.\n',
-    )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
-    )
-    passIndex: int | None = Field(
-        None,
-        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
-        ge=0,
-    )
-
-
-class Conversation(BaseModel):
-    """
-    An ordered list of messages constituting a conversation history.
-    """
-
-    id: UUID | None = Field(None, description='Server-assigned conversation id.')
-    messages: list[Message]
 
 
 class ConfigField(BaseModel):
@@ -445,36 +484,21 @@ class ConfigSchema(BaseModel):
     )
 
 
-class CallosumState(BaseModel):
-    """
-    Output of the corpus-callosum blend at the end of one bicameral pass.
-    v0.1 implements only a trivial blend (string equality / length-based
-    heuristic); v0.2+ replaces this with a real disagreement signal
-    (semantic similarity, cross-hemisphere critique, etc.).
-
-    """
-
-    agreement: float = Field(
-        ...,
-        description='Estimated agreement between the two hemispheres on this pass.\n1.0 = identical content, 0.0 = orthogonal.\n',
-        ge=0.0,
-        le=1.0,
-    )
-    decision: Decision = Field(
-        ..., description='What the orchestrator did at the end of this pass.'
-    )
-    blendedMessage: Message | None = None
-
-
-class HemispherePairInfo(BaseModel):
-    left: HemisphereInfo
-    right: HemisphereInfo
-
-
 class PassRecord(BaseModel):
     passIndex: int = Field(..., ge=0)
-    hemispheres: list[Message] = Field(..., max_length=2, min_length=1)
+    hemispheres: list[Message] = Field(
+        ...,
+        description="One `Message` per configured driver that responded on this\npass, in the order the orchestrator's `drivers` config\ndeclares them. Each message carries `driverName`. v0.1\nexpects exactly two entries.\n",
+        min_length=1,
+    )
     callosum: CallosumState
+
+
+class DriversInfo(BaseModel):
+    drivers: list[DriverHealth] = Field(
+        ...,
+        description="Per-driver health snapshot, ordered as the orchestrator's\n`drivers` config declared them.\n",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -482,7 +506,7 @@ class ChatResponse(BaseModel):
     message: Message
     passes: list[PassRecord] = Field(
         ...,
-        description='Per-pass record of what each hemisphere said and how the\ncorpus callosum scored agreement. `passes[N].hemispheres` has\ntwo entries (left, right) when both succeeded.\n',
+        description='Per-pass record of what each driver said and how the corpus\ncallosum scored agreement. `passes[N].hemispheres` has one\nentry per configured driver that responded — two in v0.1.\n',
     )
     ntStateAtStart: NTState | None = None
     ntStateAtEnd: NTState | None = None

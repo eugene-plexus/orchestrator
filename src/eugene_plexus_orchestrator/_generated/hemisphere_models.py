@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class Role(StrEnum):
@@ -19,6 +19,45 @@ class Role(StrEnum):
     user = 'user'
     assistant = 'assistant'
     hemisphere = 'hemisphere'
+
+
+class Message(BaseModel):
+    """
+    A single message in an Eugene Plexus conversation. The shape is
+    deliberately close to the OpenAI / Anthropic chat message format so
+    that adapters don't have to re-shape on every hop, but `role` includes
+    `hemisphere` for messages emitted by one of the parallel drivers
+    during a bicameral pass (visible to corpus callosum and UI debug
+    views, not normally to the end user).
+
+    """
+
+    role: Role
+    content: str = Field(
+        ...,
+        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+    )
+    driverName: str | None = Field(
+        None,
+        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
+    passIndex: int | None = Field(
+        None,
+        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
+        ge=0,
+    )
+
+
+class Conversation(BaseModel):
+    """
+    An ordered list of messages constituting a conversation history.
+    """
+
+    id: UUID | None = Field(None, description='Server-assigned conversation id.')
+    messages: list[Message]
 
 
 class NTState(BaseModel):
@@ -67,13 +106,25 @@ class NTState(BaseModel):
     )
 
 
-class Hemisphere(StrEnum):
+class DriverEntry(BaseModel):
     """
-    Which hemisphere of the bicameral pair.
+    One operator-configured hemisphere-driver in the orchestrator's
+    topology. The orchestrator owns the `name` (free-form, used for
+    labelling messages and UI tabs); drivers themselves are anonymous
+    and report only their backend / model identity. v0.1 expects two
+    entries; v0.2+ generalizes to N (with backup/failover semantics
+    layered on top).
+
     """
 
-    left = 'left'
-    right = 'right'
+    name: str = Field(
+        ...,
+        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this driver\nproduces and surfaced in the UI as the tab/column label.\n',
+        min_length=1,
+    )
+    url: AnyUrl = Field(
+        ..., description="Base URL where the driver's HTTP API is reachable."
+    )
 
 
 class BackendKind(StrEnum):
@@ -155,6 +206,7 @@ class ConfigValueType(StrEnum):
     file_path = 'file_path'
     url = 'url'
     duration = 'duration'
+    driver_list = 'driver_list'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -315,55 +367,52 @@ class Capabilities(BaseModel):
 
 
 class DriverInfo(BaseModel):
+    """
+    Driver self-description. Driver does not know its position in
+    any topology — identity (the operator-supplied name used for UI
+    labelling and message stamping) lives on the orchestrator's
+    `drivers` config and is never sourced from here.
+
+    """
+
     backend: BackendKind
     modelId: str | None = Field(
         None,
         description='Backend-specific model identifier (e.g. `"claude-opus-4-7"`).\nOptional — omitted when the driver is configured to use the\nadapter\'s built-in default rather than pinning a specific model.\n',
     )
-    hemisphere: Hemisphere
     capabilities: Capabilities | None = Field(
         None, description='Optional backend capabilities the orchestrator may key off.'
     )
     version: str | None = Field(None, description='hemisphere-driver semver.')
 
 
-class Message(BaseModel):
-    """
-    A single message in an Eugene Plexus conversation. The shape is
-    deliberately close to the OpenAI / Anthropic chat message format so
-    that adapters don't have to re-shape on every hop, but `role` includes
-    `hemisphere` for messages emitted by an individual hemisphere during
-    the bicameral pass (visible to corpus callosum and UI debug views,
-    not normally to the end user).
-
-    """
-
-    role: Role
-    content: str = Field(
+class GenerateRequest(BaseModel):
+    messages: list[Message] = Field(
         ...,
-        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+        description='Full prompt as an ordered conversation. The orchestrator is\nresponsible for inserting any NT-conditioning system message,\npersona, etc. The driver does not modify this.\n',
     )
-    hemisphere: Hemisphere | None = Field(
-        None,
-        description='When `role == "hemisphere"`, identifies which hemisphere\nproduced this message. Omitted otherwise.\n',
-    )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
-    )
+    ntState: NTState | None = None
     passIndex: int | None = Field(
         None,
-        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
+        description="Zero-based bicameral pass index. The driver itself does not\ncondition on this; it's logged for observability so a UI can\ntell which pass produced which hemisphere output.\n",
         ge=0,
     )
-
-
-class Conversation(BaseModel):
-    """
-    An ordered list of messages constituting a conversation history.
-    """
-
-    id: UUID | None = Field(None, description='Server-assigned conversation id.')
-    messages: list[Message]
+    maxTokens: int | None = Field(
+        None,
+        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(typically the orchestrator) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description="Sampling temperature. Backend-clamped. Owned by the caller\n(typically the orchestrator, where it will eventually be\nmodulated by the NT system) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
+        ge=0.0,
+        le=2.0,
+    )
+    stop: list[str] | None = Field(None, description='Optional stop sequences.')
+    requestId: UUID | None = Field(
+        None,
+        description='Caller-supplied id for log correlation. Echoed in the response.',
+    )
 
 
 class ConfigField(BaseModel):
@@ -450,33 +499,4 @@ class GenerateResponse(BaseModel):
     )
     latencyMs: int | None = Field(
         None, description='End-to-end driver-side latency in milliseconds.'
-    )
-
-
-class GenerateRequest(BaseModel):
-    messages: list[Message] = Field(
-        ...,
-        description='Full prompt as an ordered conversation. The orchestrator is\nresponsible for inserting any NT-conditioning system message,\npersona, etc. The driver does not modify this.\n',
-    )
-    ntState: NTState | None = None
-    passIndex: int | None = Field(
-        None,
-        description="Zero-based bicameral pass index. The driver itself does not\ncondition on this; it's logged for observability so a UI can\ntell which pass produced which hemisphere output.\n",
-        ge=0,
-    )
-    maxTokens: int | None = Field(
-        None,
-        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(typically the orchestrator) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
-        ge=1,
-    )
-    temperature: float | None = Field(
-        None,
-        description="Sampling temperature. Backend-clamped. Owned by the caller\n(typically the orchestrator, where it will eventually be\nmodulated by the NT system) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
-        ge=0.0,
-        le=2.0,
-    )
-    stop: list[str] | None = Field(None, description='Optional stop sequences.')
-    requestId: UUID | None = Field(
-        None,
-        description='Caller-supplied id for log correlation. Echoed in the response.',
     )

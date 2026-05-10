@@ -3,16 +3,20 @@
 For each turn:
 
 1. Build the prompt from conversation history + the new user message.
-2. Send to both hemisphere-driver instances in parallel.
+2. Send to all configured drivers in parallel.
 3. Score corpus-callosum agreement on their outputs.
 4. If agreement >= threshold, terminate and emit a blended response.
-5. Otherwise, append both hemispheres' outputs + a re-think prompt and run
+5. Otherwise, append every driver's output + a re-think prompt and run
    another pass, up to `max_passes`.
 
 v0.1 keeps this *deliberately mechanical*: there's no smart prompting
-between passes, no per-hemisphere prompt variation, no NT modulation. The
+between passes, no per-driver prompt variation, no NT modulation. The
 goal is to validate the cross-vendor architecture; meaningful pass-policy
 work comes after we have data.
+
+v0.1 also pins the loop at *exactly two* drivers — the agreement scoring
+and blend functions are pairwise. v0.2+ generalizes to N (with a real
+N-way reconciliation strategy and failover semantics).
 """
 
 from __future__ import annotations
@@ -25,7 +29,6 @@ from .._generated.hemisphere_models import GenerateRequest
 from .._generated.models import (
     CallosumState,
     Decision,
-    Hemisphere,
     Message,
     NTState,
     PassRecord,
@@ -43,6 +46,15 @@ REPROMPT_INSTRUCTION = (
 )
 
 
+class BicameralPairRequired(RuntimeError):
+    """Raised when the orchestrator's `drivers` list is not exactly two.
+
+    v0.1's agreement / blend functions are pairwise; running with a
+    different driver count would silently misbehave. v0.2+ will replace
+    this guard with a real N-way reconciliation strategy.
+    """
+
+
 @dataclass
 class BicameralOutcome:
     """Result of running the bicameral loop for one turn."""
@@ -54,8 +66,7 @@ class BicameralOutcome:
 async def run_bicameral_loop(
     *,
     initial_messages: list[Message],
-    left: HemisphereClient,
-    right: HemisphereClient,
+    drivers: list[HemisphereClient],
     nt_state: NTState,
     max_passes: int,
     agreement_threshold: float,
@@ -69,7 +80,18 @@ async def run_bicameral_loop(
     driver does not substitute defaults of its own. In v0.2+ these will be
     derived per-pass from `nt_state` instead of being supplied as flat
     arguments — until then the caller passes the configured baseline.
+
+    `drivers` carries the operator-supplied driver names; each emitted
+    `Message` is stamped with `driverName` so the UI and downstream
+    consumers can label outputs without knowing the topology in advance.
     """
+    if len(drivers) != 2:
+        raise BicameralPairRequired(
+            f"v0.1 bicameral loop requires exactly two drivers; got {len(drivers)}. "
+            "N-driver reconciliation lands in v0.2+."
+        )
+    left, right = drivers[0], drivers[1]
+
     passes: list[PassRecord] = []
     messages: list[Message] = list(initial_messages)
 
@@ -89,7 +111,7 @@ async def run_bicameral_loop(
             request_payload["maxTokens"] = max_tokens
         gen_request = GenerateRequest.model_validate(request_payload)
 
-        log.debug("bicameral pass %d: dispatching to both hemispheres", pass_index)
+        log.debug("bicameral pass %d: dispatching to %d drivers", pass_index, len(drivers))
         left_resp, right_resp = await asyncio.gather(
             left.generate(gen_request),
             right.generate(gen_request),
@@ -98,13 +120,13 @@ async def run_bicameral_loop(
         left_msg = Message(
             role=Role.hemisphere,
             content=left_resp.content,
-            hemisphere=Hemisphere.left,
+            driverName=left.name,
             passIndex=pass_index,
         )
         right_msg = Message(
             role=Role.hemisphere,
             content=right_resp.content,
-            hemisphere=Hemisphere.right,
+            driverName=right.name,
             passIndex=pass_index,
         )
 
