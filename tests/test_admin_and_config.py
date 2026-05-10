@@ -123,7 +123,6 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
     expected = {
         "drivers",
         "memoryUrl",
-        "port",
         "logLevel",
         "defaultMaxPasses",
         "agreementThreshold",
@@ -136,6 +135,8 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
     # The legacy left/right URL fields are gone — replaced by `drivers`.
     assert "leftDriverUrl" not in keys
     assert "rightDriverUrl" not in keys
+    # `port` is no longer a config field — owned by the watchdog topology.
+    assert "port" not in keys
 
     drivers_field = next(f for f in body["fields"] if f["key"] == "drivers")
     assert drivers_field["valueType"] == "driver_list"

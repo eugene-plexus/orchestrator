@@ -86,22 +86,11 @@ FIELDS: list[ConfigField] = [
         required=True,
         requiresRestart=True,
     ),
-    ConfigField(
-        key="port",
-        label="HTTP port",
-        description=(
-            "Port the *orchestrator itself* listens on. The UI and any "
-            "other chat client connects to this port. Drivers and the "
-            "memory service have their own separate ports — those are "
-            "configured per-component, not here. v0.1 default is 8080."
-        ),
-        category="network",
-        valueType=ConfigValueType.integer,
-        default=8080,
-        minimum=1,
-        maximum=65535,
-        requiresRestart=True,
-    ),
+    # The orchestrator's bind port used to live here. It moved out:
+    # ports are owned by the watchdog topology now and passed to spawned
+    # children via EUGENE_PLEXUS_ORCH_BIND_PORT. One source of truth
+    # avoids the OpenClaw-style "config says 8080 but watchdog spawned
+    # at 8090, nobody can reach the orchestrator" trap.
     ConfigField(
         key="logLevel",
         label="Log level",
