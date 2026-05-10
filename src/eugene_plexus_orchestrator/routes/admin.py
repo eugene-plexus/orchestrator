@@ -1,9 +1,10 @@
-"""Admin endpoints: /v1/admin/drivers, /v1/admin/drivers/probe, /v1/admin/nt-state."""
+"""Admin endpoints: drivers (list, probe), nt-state, and restart."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
@@ -15,6 +16,7 @@ from .._generated.models import (
     DriversInfo,
     NTState,
     Problem,
+    RestartResult,
 )
 from ..bicameral.nt import neutral_state
 from ..hemisphere_client import HemisphereClient, HttpHemisphereClient
@@ -117,3 +119,33 @@ async def probe_driver(body: DriverEntry) -> DriverHealth:
 @router.get("/v1/admin/nt-state", response_model=NTState)
 async def get_nt_state() -> NTState:
     return neutral_state()
+
+
+# Long enough for the 202 response body to flush back to the client over
+# a slow LAN, short enough that the operator doesn't sit waiting.
+_RESTART_DELAY_MS = 500
+
+
+@router.post("/v1/admin/restart", response_model=RestartResult, status_code=202)
+async def restart() -> RestartResult:
+    """Schedule a process exit so a supervisor can relaunch with new config.
+
+    Mirrors the hemisphere-driver restart endpoint. The orchestrator
+    only re-reads `requiresRestart: true` config keys (drivers list,
+    port, etc.) at startup; this is the UI's mechanism for completing a
+    config-change flow.
+    """
+    log.warning("restart requested via /v1/admin/restart; exiting in %dms", _RESTART_DELAY_MS)
+
+    loop = asyncio.get_event_loop()
+    loop.call_later(_RESTART_DELAY_MS / 1000.0, lambda: os._exit(0))
+
+    return RestartResult(
+        scheduled=True,
+        delayMs=_RESTART_DELAY_MS,
+        message=(
+            f"Process exiting in {_RESTART_DELAY_MS}ms. A supervisor (systemd, "
+            "docker, deploy launcher, …) is expected to relaunch it; in v0.1 "
+            "personal-use installs without one, relaunch manually."
+        ),
+    )

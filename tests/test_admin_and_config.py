@@ -82,6 +82,38 @@ def test_admin_nt_state_returns_neutral_baseline(client: TestClient) -> None:
         assert body[key] == 0.5
 
 
+def test_admin_restart_returns_202_and_schedules_exit(
+    client: TestClient, monkeypatch: object
+) -> None:
+    """Verify /v1/admin/restart returns the right shape and schedules a
+    delayed exit. We intercept the asyncio loop's call_later so the test
+    process doesn't actually exit."""
+    captured: dict[str, object] = {}
+
+    class _FakeLoop:
+        def call_later(self, delay: float, callback: object) -> None:
+            captured["delay"] = delay
+            captured["callback"] = callback
+
+    import asyncio as _asyncio
+
+    real_get_event_loop = _asyncio.get_event_loop
+    monkeypatch.setattr(_asyncio, "get_event_loop", lambda: _FakeLoop())  # type: ignore[attr-defined]
+
+    try:
+        response = client.post("/v1/admin/restart")
+    finally:
+        monkeypatch.setattr(_asyncio, "get_event_loop", real_get_event_loop)  # type: ignore[attr-defined]
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["scheduled"] is True
+    assert body["delayMs"] >= 0
+    assert "message" in body
+    assert captured["delay"] == body["delayMs"] / 1000.0
+    assert callable(captured["callback"])
+
+
 def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
     response = client.get("/v1/config/schema")
     assert response.status_code == 200
