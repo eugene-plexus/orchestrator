@@ -28,6 +28,7 @@ REDACTED = "<redacted>"
 
 CATEGORY_LABELS: dict[str, str] = {
     "hemispheres": "Hemisphere Pair",
+    "memory": "Memory Service",
     "network": "Network",
     "logging": "Logging",
     "bicameral": "Bicameral Loop",
@@ -59,6 +60,20 @@ FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.url,
         default="http://127.0.0.1:8082",
         required=True,
+    ),
+    ConfigField(
+        key="memoryUrl",
+        label="Memory Service URL",
+        description=(
+            "Base URL of the eugene-plexus/memory service. The orchestrator "
+            "delegates conversation persistence here. Restart required so "
+            "the HTTP client picks up the new base URL."
+        ),
+        category="memory",
+        valueType=ConfigValueType.url,
+        default="http://127.0.0.1:8083",
+        required=True,
+        requiresRestart=True,
     ),
     ConfigField(
         key="port",

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from . import __version__
 from .config import ConfigStore
 from .hemisphere_client import HemisphereClient, HttpHemisphereClient
-from .memory import InProcessMemory
+from .memory import HttpMemory, MemoryClient
 from .routes import admin as admin_routes
 from .routes import chat as chat_routes
 from .routes import config as config_routes
@@ -34,6 +34,17 @@ def build_clients(store: ConfigStore) -> tuple[HemisphereClient, HemisphereClien
     return left, right, left_url, right_url
 
 
+def build_memory(store: ConfigStore) -> tuple[MemoryClient, str]:
+    """Construct the memory client from config. Returns (client, url)."""
+    memory_url = str(store.get("memoryUrl") or "http://127.0.0.1:8083")
+    # Memory ops are short — append a message, fetch a conversation. The
+    # 30s ceiling here is far more generous than needed but matches the
+    # connection-timeout shape used elsewhere; bump only if a future
+    # backend (DB-backed retrieval, vector search) needs longer.
+    timeout = 30.0
+    return HttpMemory(base_url=memory_url, timeout_seconds=timeout), memory_url
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
@@ -41,11 +52,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     store.load()
     app.state.config_store = store
 
-    app.state.memory = InProcessMemory()
+    # Same injection trick as hemisphere clients: tests pre-populate
+    # `app.state.memory` with an `InProcessMemory` so the lifespan
+    # doesn't try to reach a real memory service. In production the
+    # `HttpMemory` is built here.
+    if not hasattr(app.state, "memory"):
+        memory, memory_url = build_memory(store)
+        app.state.memory = memory
+        app.state.memory_url = memory_url
+        owns_memory = True
+    else:
+        owns_memory = False
+        app.state.memory_url = getattr(app.state, "memory_url", "")
 
     if not hasattr(app.state, "left_driver") or not hasattr(app.state, "right_driver"):
-        # Tests can pre-populate left_driver / right_driver before the lifespan
-        # runs to inject fakes. Only build real HTTP clients otherwise.
         left, right, left_url, right_url = build_clients(store)
         app.state.left_driver = left
         app.state.right_driver = right
@@ -60,6 +80,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if owns_memory:
+            await app.state.memory.aclose()
         if owns_clients:
             await app.state.left_driver.aclose()
             await app.state.right_driver.aclose()

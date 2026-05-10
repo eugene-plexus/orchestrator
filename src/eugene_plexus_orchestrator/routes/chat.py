@@ -18,7 +18,7 @@ from ..bicameral.loop import run_bicameral_loop
 from ..bicameral.nt import neutral_state
 from ..config import ConfigStore
 from ..hemisphere_client import HemisphereClient
-from ..memory import InProcessMemory
+from ..memory import MemoryClient
 
 router = APIRouter(tags=["chat"])
 
@@ -45,32 +45,45 @@ def _build_initial_messages(
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     store: ConfigStore = request.app.state.config_store
-    memory: InProcessMemory = request.app.state.memory
+    memory: MemoryClient = request.app.state.memory
     left: HemisphereClient = request.app.state.left_driver
     right: HemisphereClient = request.app.state.right_driver
 
-    if body.conversationId is not None:
-        existing = memory.get(body.conversationId)
-        if existing is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=Problem(
-                    type="https://github.com/eugene-plexus/orchestrator#conversation-not-found",
-                    title="Conversation not found",
-                    status=404,
-                    detail=f"No conversation with id {body.conversationId}.",
-                    component="orchestrator",
-                ).model_dump(exclude_none=True),
-            )
-        conversation_id = body.conversationId
-        history = list(existing.messages)
-    else:
-        conversation_id = memory.create()
-        history = []
+    try:
+        if body.conversationId is not None:
+            existing = await memory.get(body.conversationId)
+            if existing is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=Problem(
+                        type="https://github.com/eugene-plexus/orchestrator#conversation-not-found",
+                        title="Conversation not found",
+                        status=404,
+                        detail=f"No conversation with id {body.conversationId}.",
+                        component="orchestrator",
+                    ).model_dump(exclude_none=True),
+                )
+            conversation_id = body.conversationId
+            history = list(existing.messages)
+        else:
+            conversation_id = await memory.create()
+            history = []
 
-    system_prompt = body.systemPrompt or str(store.get("defaultSystemPrompt") or "")
-    user_message = Message(role=Role.user, content=body.message)
-    memory.append(conversation_id, user_message)
+        system_prompt = body.systemPrompt or str(store.get("defaultSystemPrompt") or "")
+        user_message = Message(role=Role.user, content=body.message)
+        await memory.append(conversation_id, user_message)
+    except httpx.HTTPError as e:
+        log.warning("memory service unreachable: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#memory-error",
+                title="Memory service error",
+                status=502,
+                detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        ) from e
 
     initial_messages = _build_initial_messages(history, system_prompt, body.message)
 
@@ -100,7 +113,20 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             ).model_dump(exclude_none=True),
         ) from e
 
-    memory.append(conversation_id, outcome.final_message)
+    try:
+        await memory.append(conversation_id, outcome.final_message)
+    except httpx.HTTPError as e:
+        log.warning("memory service unreachable while persisting reply: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#memory-error",
+                title="Memory service error",
+                status=502,
+                detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        ) from e
 
     return ChatResponse(
         conversationId=conversation_id,

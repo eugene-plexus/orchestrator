@@ -23,6 +23,7 @@ from eugene_plexus_orchestrator._generated.hemisphere_models import (
     Hemisphere,
 )
 from eugene_plexus_orchestrator.app import create_app
+from eugene_plexus_orchestrator.memory import InProcessMemory
 from eugene_plexus_orchestrator.settings import Settings
 
 
@@ -100,6 +101,8 @@ def app(
     app.state.right_driver = right_fake
     app.state.left_driver_url = "http://fake-left"
     app.state.right_driver_url = "http://fake-right"
+    app.state.memory = InProcessMemory()
+    app.state.memory_url = "in-process"
     return app
 
 
