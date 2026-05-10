@@ -185,6 +185,10 @@ class Health(BaseModel):
     component: str | None = Field(
         None, description='Component identifier (e.g. `"hemisphere-driver"`).'
     )
+    safeMode: bool | None = Field(
+        False,
+        description="True when the component was started with the watchdog's\nsafe-mode env var set\n(`EUGENE_PLEXUS_<KIND>_SAFE_MODE=1`) and is therefore\nrunning on built-in defaults instead of its persisted\nconfig. Components in safe mode are reachable for config\nediting (`PATCH /v1/config` writes to disk normally) but\nshould be considered non-functional for their primary\npurpose until restarted without the flag. `status` is\nalso reported as `degraded` while safe mode is in effect.\n",
+    )
     details: dict[str, Any] | None = Field(
         None, description='Optional component-specific health detail.'
     )

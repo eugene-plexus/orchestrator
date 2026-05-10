@@ -44,6 +44,26 @@ def _build_initial_messages(
 
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
+    if getattr(request.app.state, "safe_mode", False):
+        # Per the safe-mode contract: orchestrator stays reachable for
+        # config edits but its primary endpoint returns 503 until the
+        # operator fixes config and restarts without the env var.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#safe-mode",
+                title="Orchestrator is in safe mode",
+                status=503,
+                detail=(
+                    "The orchestrator was started with "
+                    "EUGENE_PLEXUS_ORCH_SAFE_MODE=1 and is running on "
+                    "built-in defaults. Fix the on-disk config via "
+                    "PATCH /v1/config, then restart without the env var."
+                ),
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        )
+
     store: ConfigStore = request.app.state.config_store
     memory: MemoryClient = request.app.state.memory
     drivers: list[HemisphereClient] = request.app.state.drivers

@@ -56,25 +56,47 @@ def build_memory(store: ConfigStore) -> tuple[MemoryClient, str]:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
     store = ConfigStore(settings.config_file)
-    store.load()
+    if settings.safe_mode:
+        # Safe mode: ignore the on-disk config, leaving the store with
+        # built-in defaults. PATCH /v1/config still writes to disk so the
+        # operator's repair survives the next non-safe-mode boot. No
+        # drivers, no memory client — chat returns 503 until restart.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "starting in SAFE MODE (EUGENE_PLEXUS_ORCH_SAFE_MODE=1); "
+            "ignoring %s and running on defaults. Fix config via "
+            "/v1/config, then restart without the env var.",
+            settings.config_file,
+        )
+    else:
+        store.load()
     app.state.config_store = store
+    app.state.safe_mode = settings.safe_mode
 
     # Same injection trick as hemisphere clients: tests pre-populate
     # `app.state.memory` with an `InProcessMemory` so the lifespan
     # doesn't try to reach a real memory service. In production the
     # `HttpMemory` is built here.
     if not hasattr(app.state, "memory"):
-        memory, memory_url = build_memory(store)
-        app.state.memory = memory
-        app.state.memory_url = memory_url
-        owns_memory = True
+        if settings.safe_mode:
+            app.state.memory = None
+            app.state.memory_url = ""
+            owns_memory = False
+        else:
+            memory, memory_url = build_memory(store)
+            app.state.memory = memory
+            app.state.memory_url = memory_url
+            owns_memory = True
     else:
         owns_memory = False
         app.state.memory_url = getattr(app.state, "memory_url", "")
 
     if not hasattr(app.state, "drivers"):
-        app.state.drivers = build_clients(store)
-        owns_clients = True
+        # Defaults have no `drivers` configured; build_clients returns []
+        # in safe mode anyway, but skip the call for clarity.
+        app.state.drivers = [] if settings.safe_mode else build_clients(store)
+        owns_clients = not settings.safe_mode
     else:
         owns_clients = False
 
