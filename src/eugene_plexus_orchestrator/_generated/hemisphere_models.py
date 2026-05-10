@@ -465,10 +465,15 @@ class GenerateRequest(BaseModel):
         ge=0,
     )
     maxTokens: int | None = Field(
-        None, description='Maximum output tokens. Backend-clamped.', ge=1
+        None,
+        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(typically the orchestrator) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
+        ge=1,
     )
     temperature: float | None = Field(
-        None, description='Sampling temperature. Backend-clamped.', ge=0.0, le=2.0
+        None,
+        description="Sampling temperature. Backend-clamped. Owned by the caller\n(typically the orchestrator, where it will eventually be\nmodulated by the NT system) — the driver does not apply a\nlocal default. Adapters whose backends don't expose this\nknob (e.g. agentic CLIs) silently ignore it.\n",
+        ge=0.0,
+        le=2.0,
     )
     stop: list[str] | None = Field(None, description='Optional stop sequences.')
     requestId: UUID | None = Field(

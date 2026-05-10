@@ -32,6 +32,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "network": "Network",
     "logging": "Logging",
     "bicameral": "Bicameral Loop",
+    "generation": "Generation Defaults (NT-modulated in v0.2+)",
     "persona": "Persona",
 }
 
@@ -143,6 +144,35 @@ FIELDS: list[ConfigField] = [
         category="persona",
         valueType=ConfigValueType.string,
         default=DEFAULT_SYSTEM_PROMPT,
+    ),
+    ConfigField(
+        key="defaultTemperature",
+        label="Default Temperature",
+        description=(
+            "Sampling temperature sent to both hemispheres on every "
+            "generate request. v0.1 placeholder: in v0.2+ the NT system "
+            "modulates this per-pass and per-hemisphere from "
+            "neurotransmitter state; this field becomes the unmodulated "
+            "baseline. Read live at request time — no restart needed."
+        ),
+        category="generation",
+        valueType=ConfigValueType.number,
+        default=0.7,
+        minimum=0.0,
+        maximum=2.0,
+    ),
+    ConfigField(
+        key="defaultMaxTokens",
+        label="Default Max Tokens",
+        description=(
+            "Maximum output tokens sent to both hemispheres on every "
+            "generate request. v0.1 placeholder for the future NT "
+            "system. Read live at request time — no restart needed."
+        ),
+        category="generation",
+        valueType=ConfigValueType.integer,
+        default=2048,
+        minimum=1,
     ),
     ConfigField(
         key="requestTimeoutSeconds",

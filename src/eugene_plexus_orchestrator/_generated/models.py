@@ -26,12 +26,6 @@ class ChatRequest(BaseModel):
         ge=1,
         le=10,
     )
-    temperature: float | None = Field(
-        None,
-        description='Optional override; otherwise driver defaults apply.',
-        ge=0.0,
-        le=2.0,
-    )
     requestId: UUID | None = Field(
         None, description='Caller-supplied id for log correlation.'
     )

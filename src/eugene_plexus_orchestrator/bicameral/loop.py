@@ -59,8 +59,17 @@ async def run_bicameral_loop(
     nt_state: NTState,
     max_passes: int,
     agreement_threshold: float,
+    temperature: float | None,
+    max_tokens: int | None,
 ) -> BicameralOutcome:
-    """Drive the bicameral loop for a single user turn."""
+    """Drive the bicameral loop for a single user turn.
+
+    `temperature` and `max_tokens` are applied to every `GenerateRequest`
+    built here. The orchestrator owns LLM-output-affecting parameters; the
+    driver does not substitute defaults of its own. In v0.2+ these will be
+    derived per-pass from `nt_state` instead of being supplied as flat
+    arguments — until then the caller passes the configured baseline.
+    """
     passes: list[PassRecord] = []
     messages: list[Message] = list(initial_messages)
 
@@ -69,13 +78,16 @@ async def run_bicameral_loop(
         # The orchestrator.yaml and hemisphere-driver.yaml each have their
         # own generated Message / NTState classes (same wire shape, distinct
         # Python types because we keep the two model modules independent).
-        gen_request = GenerateRequest.model_validate(
-            {
-                "messages": [m.model_dump(mode="json", exclude_none=True) for m in messages],
-                "ntState": nt_state.model_dump(exclude_none=True),
-                "passIndex": pass_index,
-            }
-        )
+        request_payload: dict[str, object] = {
+            "messages": [m.model_dump(mode="json", exclude_none=True) for m in messages],
+            "ntState": nt_state.model_dump(exclude_none=True),
+            "passIndex": pass_index,
+        }
+        if temperature is not None:
+            request_payload["temperature"] = temperature
+        if max_tokens is not None:
+            request_payload["maxTokens"] = max_tokens
+        gen_request = GenerateRequest.model_validate(request_payload)
 
         log.debug("bicameral pass %d: dispatching to both hemispheres", pass_index)
         left_resp, right_resp = await asyncio.gather(

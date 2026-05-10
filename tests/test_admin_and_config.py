@@ -68,6 +68,8 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
         "defaultMaxPasses",
         "agreementThreshold",
         "defaultSystemPrompt",
+        "defaultTemperature",
+        "defaultMaxTokens",
         "requestTimeoutSeconds",
     }
     assert expected.issubset(keys)

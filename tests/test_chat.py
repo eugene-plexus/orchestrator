@@ -96,3 +96,34 @@ def test_chat_404s_when_unknown_conversation_id_supplied(client: TestClient) -> 
 def test_chat_stream_still_returns_501(client: TestClient) -> None:
     response = client.post("/v1/chat/stream", json={"message": "hi"})
     assert response.status_code == 501
+
+
+def test_chat_sets_temperature_and_max_tokens_from_config_on_every_pass(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """LLM-output-affecting params are owned by the orchestrator. Every
+    GenerateRequest the driver sees must carry them — sourced from
+    orchestrator config in v0.1, from NT state in v0.2+. Drivers may not
+    fall back to local defaults."""
+    # Override the defaults so we know any value present came from config,
+    # not a request-construction fallback.
+    patch = client.patch(
+        "/v1/config",
+        json={"defaultTemperature": 0.3, "defaultMaxTokens": 512},
+    )
+    assert patch.status_code == 200, patch.text
+
+    left_fake.responses = ["alpha", "beta"]
+    right_fake.responses = ["gamma", "beta"]
+
+    response = client.post("/v1/chat", json={"message": "hi", "maxPasses": 2})
+    assert response.status_code == 200, response.text
+
+    # Both hemispheres got at least one call. Every recorded GenerateRequest
+    # — across passes — must carry the configured defaults.
+    assert left_fake.calls and right_fake.calls
+    for req in left_fake.calls + right_fake.calls:
+        assert req.temperature == 0.3
+        assert req.maxTokens == 512

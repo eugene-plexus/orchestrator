@@ -90,6 +90,12 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     nt_at_start = neutral_state()
     max_passes = int(body.maxPasses or store.get("defaultMaxPasses") or 3)
     agreement_threshold = float(store.get("agreementThreshold") or 0.5)
+    # LLM-output-affecting params are owned by the orchestrator. v0.1 reads
+    # static defaults from config; v0.2+ will derive them from NT state.
+    temperature_cfg = store.get("defaultTemperature")
+    temperature = float(temperature_cfg) if temperature_cfg is not None else None
+    max_tokens_cfg = store.get("defaultMaxTokens")
+    max_tokens = int(max_tokens_cfg) if max_tokens_cfg is not None else None
 
     try:
         outcome = await run_bicameral_loop(
@@ -99,6 +105,8 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             nt_state=nt_at_start,
             max_passes=max_passes,
             agreement_threshold=agreement_threshold,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
     except httpx.HTTPError as e:
         log.warning("bicameral loop failed at HTTP layer: %s", e)
