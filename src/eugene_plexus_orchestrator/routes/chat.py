@@ -17,7 +17,7 @@ from .._generated.models import (
 from ..bicameral.loop import run_bicameral_loop
 from ..bicameral.nt import neutral_state
 from ..config import ConfigStore
-from ..hemisphere_client import HemisphereClient
+from ..hemisphere_client import HemisphereClient, HemisphereDriverError
 from ..memory import MemoryClient
 
 router = APIRouter(tags=["chat"])
@@ -106,13 +106,48 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+    except HemisphereDriverError as e:
+        # The driver returned a structured error — surface its actual
+        # `Problem` body to the user instead of the generic httpx text.
+        # Most useful failure mode: model-specific upstream errors
+        # (OpenAI rejecting temperature, missing CLI binary, etc.) come
+        # through readable rather than as an opaque "502 Bad Gateway".
+        log.warning(
+            "hemisphere %r returned %d: %s",
+            e.driver_name,
+            e.status_code,
+            e.problem.detail if e.problem else e.raw_body[:200],
+        )
+        upstream = e.problem
+        upstream_title = upstream.title if upstream else "Hemisphere driver error"
+        upstream_detail = upstream.detail if upstream else (e.raw_body[:500] or "(no body)")
+        upstream_component = (
+            upstream.component if upstream else f"hemisphere-driver:{e.driver_name}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#hemisphere-error",
+                title=f"Hemisphere {e.driver_name!r} failed: {upstream_title}",
+                status=502,
+                detail=(
+                    f"{upstream_detail} "
+                    f"(driver={e.driver_name}, url={e.driver_url}, "
+                    f"upstream-status={e.status_code}, "
+                    f"upstream-component={upstream_component})"
+                ),
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        ) from e
     except httpx.HTTPError as e:
+        # Network-level failure: connection refused, timeout, DNS, etc.
+        # No driver-side body to extract — fall back to the httpx string.
         log.warning("bicameral loop failed at HTTP layer: %s", e)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=Problem(
                 type="https://github.com/eugene-plexus/orchestrator#hemisphere-error",
-                title="Hemisphere driver error",
+                title="Hemisphere driver unreachable",
                 status=502,
                 detail=str(e),
                 component="orchestrator",

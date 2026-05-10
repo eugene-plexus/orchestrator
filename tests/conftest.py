@@ -45,6 +45,8 @@ class FakeHemisphereClient:
         """FIFO queue of canned responses; tests assign before calling the route."""
         self.calls: list[GenerateRequest] = []
         self.info_error: Exception | None = None
+        self.generate_error: Exception | None = None
+        """If set, `generate()` raises this instead of returning a response."""
 
     async def info(self) -> DriverInfo:
         if self.info_error is not None:
@@ -57,6 +59,8 @@ class FakeHemisphereClient:
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         self.calls.append(request)
+        if self.generate_error is not None:
+            raise self.generate_error
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
         return GenerateResponse(
             content=text,

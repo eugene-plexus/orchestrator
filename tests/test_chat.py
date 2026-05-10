@@ -101,6 +101,75 @@ def test_chat_stream_still_returns_501(client: TestClient) -> None:
     assert response.status_code == 501
 
 
+def test_chat_502_propagates_driver_problem_detail(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """When a driver returns a structured Problem (e.g. OpenAI rejected
+    a parameter), the orchestrator surfaces its title + detail in the
+    response — not the generic httpx '502 Bad Gateway' string. Without
+    this, debugging upstream model errors means tailing driver logs
+    every time."""
+    from eugene_plexus_orchestrator._generated.hemisphere_models import Problem
+    from eugene_plexus_orchestrator.hemisphere_client import HemisphereDriverError
+
+    upstream_detail = (
+        "openai_api returned 400: Unsupported value: 'temperature' does not "
+        "support 0.7 with this model. Only the default (1) value is supported."
+    )
+    right_fake.generate_error = HemisphereDriverError(
+        driver_name=right_fake.name,
+        driver_url=right_fake.base_url,
+        status_code=502,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/hemisphere-driver#cli-error",
+            title="Backend CLI error",
+            status=502,
+            detail=upstream_detail,
+            component="hemisphere-driver:openai_api",
+        ),
+        raw_body="{}",
+    )
+
+    response = client.post("/v1/chat", json={"message": "hi"})
+    assert response.status_code == 502
+    body = response.json()
+    detail = body["detail"]
+    # Driver name + upstream title appear in the orchestrator's title.
+    assert "right" in detail["title"]
+    assert "Backend CLI error" in detail["title"]
+    # Upstream detail (the actual root cause) appears verbatim.
+    assert "temperature" in detail["detail"]
+    assert "0.7" in detail["detail"]
+    # Provenance is preserved so an operator can trace the error.
+    assert "hemisphere-driver:openai_api" in detail["detail"]
+
+
+def test_chat_502_falls_back_to_raw_body_when_driver_returns_non_problem(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """If the driver's error response isn't parseable as Problem JSON,
+    the orchestrator falls back to including the raw body — never just
+    swallows it into a generic message."""
+    from eugene_plexus_orchestrator.hemisphere_client import HemisphereDriverError
+
+    right_fake.generate_error = HemisphereDriverError(
+        driver_name=right_fake.name,
+        driver_url=right_fake.base_url,
+        status_code=500,
+        problem=None,
+        raw_body="<html>500 Internal Server Error from a misbehaving proxy</html>",
+    )
+    response = client.post("/v1/chat", json={"message": "hi"})
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert "misbehaving proxy" in detail["detail"]
+    assert "upstream-status=500" in detail["detail"]
+
+
 def test_chat_sets_temperature_and_max_tokens_from_config_on_every_pass(
     client: TestClient,
     left_fake: FakeHemisphereClient,
