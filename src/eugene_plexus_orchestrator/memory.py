@@ -74,11 +74,22 @@ class InProcessMemory:
 class HttpMemory:
     """HTTP-backed memory client. Talks to eugene-plexus/memory."""
 
-    def __init__(self, *, base_url: str, timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout_seconds: float = 30.0,
+        service_token: str | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
+        # See HttpHemisphereClient — same pattern: thread the
+        # orchestrator's service-audience bearer onto every outbound
+        # request to the memory service.
+        headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+            headers=headers,
         )
 
     @property

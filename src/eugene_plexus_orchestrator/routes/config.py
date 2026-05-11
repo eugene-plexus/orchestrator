@@ -60,13 +60,15 @@ async def test_config(
     drivers_raw = get("drivers") or []
     memory_url = str(get("memoryUrl") or "")
     timeout = float(get("requestTimeoutSeconds") or 30)
+    service_token = request.app.state.auth_state.service_token
+    probe_headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
 
     async def probe(name: str, base_url: str, path: str) -> tuple[str, str | None]:
         """Returns (target-name, error-or-None)."""
         if not base_url:
             return name, f"{name} URL is empty"
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, headers=probe_headers) as client:
                 response = await client.get(base_url.rstrip("/") + path)
                 response.raise_for_status()
         except Exception as e:

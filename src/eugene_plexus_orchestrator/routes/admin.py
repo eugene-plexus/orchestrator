@@ -96,7 +96,7 @@ async def list_drivers(request: Request) -> DriversInfo:
 
 
 @router.post("/v1/admin/drivers/probe", response_model=DriverHealth)
-async def probe_driver(body: DriverEntry) -> DriverHealth:
+async def probe_driver(request: Request, body: DriverEntry) -> DriverHealth:
     """Test-connect to an arbitrary driver URL without persisting it.
 
     Backs the UI's per-row Test button in the drivers list editor —
@@ -105,10 +105,12 @@ async def probe_driver(body: DriverEntry) -> DriverHealth:
     returns the same `DriverHealth` shape the list endpoint uses.
     """
     url = str(body.url).rstrip("/")
+    service_token = request.app.state.auth_state.service_token
     client = HttpHemisphereClient(
         name=body.name,
         base_url=url,
         timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+        service_token=service_token,
     )
     try:
         return await _driver_health(client)

@@ -108,12 +108,19 @@ class HttpHemisphereClient:
         name: str,
         base_url: str,
         timeout_seconds: float = 180.0,
+        service_token: str | None = None,
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
+        # When the watchdog threaded a service token in, attach it to
+        # every outbound call. The driver validates against the shared
+        # HMAC signing key. Headers stay unset when running unauthenticated
+        # (dev / standalone) so the existing test path still works.
+        headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+            headers=headers,
         )
 
     async def info(self) -> DriverInfo:

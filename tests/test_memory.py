@@ -67,7 +67,7 @@ async def test_in_process_delete_removes() -> None:
 def _http_memory_with(handler: httpx.MockTransport) -> HttpMemory:
     """Build an HttpMemory whose underlying client uses the given mock transport."""
     mem = HttpMemory(base_url="http://fake-memory")
-    mem._client._transport = handler  # type: ignore[attr-defined]
+    mem._client._transport = handler
     return mem
 
 
