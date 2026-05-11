@@ -63,6 +63,22 @@ class BicameralOutcome:
     passes: list[PassRecord]
 
 
+# Max characters per message preview in DEBUG-level traces. Long enough
+# for short prompts to render in full, short enough that a multi-pass
+# loop with 4K-token hemispheres doesn't drown the log file.
+_DEBUG_PREVIEW_CHARS = 400
+
+
+def _preview(text: str, *, limit: int = _DEBUG_PREVIEW_CHARS) -> str:
+    """One-line preview of message content for DEBUG logs. Collapses
+    newlines to ⏎ and truncates with a length suffix so the operator can
+    see how much they're missing."""
+    flat = text.replace("\n", "⏎ ")
+    if len(flat) <= limit:
+        return flat
+    return f"{flat[:limit]}… [+{len(flat) - limit} chars]"
+
+
 async def run_bicameral_loop(
     *,
     initial_messages: list[Message],
@@ -112,10 +128,39 @@ async def run_bicameral_loop(
         gen_request = GenerateRequest.model_validate(request_payload)
 
         log.debug("bicameral pass %d: dispatching to %d drivers", pass_index, len(drivers))
+        if log.isEnabledFor(logging.DEBUG):
+            for i, m in enumerate(messages):
+                log.debug(
+                    "  pass %d outgoing[%d] role=%s%s content=%s",
+                    pass_index,
+                    i,
+                    m.role.value,
+                    f" driver={m.driverName}" if m.driverName else "",
+                    _preview(m.content),
+                )
+
         left_resp, right_resp = await asyncio.gather(
             left.generate(gen_request),
             right.generate(gen_request),
         )
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "  pass %d response left (%s) finish=%s latency=%dms: %s",
+                pass_index,
+                left.name,
+                left_resp.finishReason.value,
+                left_resp.latencyMs or 0,
+                _preview(left_resp.content),
+            )
+            log.debug(
+                "  pass %d response right (%s) finish=%s latency=%dms: %s",
+                pass_index,
+                right.name,
+                right_resp.finishReason.value,
+                right_resp.latencyMs or 0,
+                _preview(right_resp.content),
+            )
 
         left_msg = Message(
             role=Role.hemisphere,
@@ -133,6 +178,14 @@ async def run_bicameral_loop(
         score = jaccard_word_agreement(left_resp.content, right_resp.content)
         is_last_pass = pass_index == max_passes - 1
         agreed = score >= agreement_threshold
+        log.debug(
+            "  pass %d callosum agreement=%.3f threshold=%.2f agreed=%s is_last=%s",
+            pass_index,
+            score,
+            agreement_threshold,
+            agreed,
+            is_last_pass,
+        )
 
         if agreed or is_last_pass:
             decision = Decision.terminate if agreed else Decision.cap_reached
@@ -159,6 +212,7 @@ async def run_bicameral_loop(
                 score,
                 decision.value,
             )
+            log.debug("  pass %d blended: %s", pass_index, _preview(blended_text))
             return BicameralOutcome(final_message=blended_msg, passes=passes)
 
         passes.append(
@@ -174,7 +228,13 @@ async def run_bicameral_loop(
 
         messages.append(left_msg)
         messages.append(right_msg)
-        messages.append(Message(role=Role.system, content=REPROMPT_INSTRUCTION))
+        # REPROMPT is sent as `user` not `system` — many providers
+        # (MiniMax-M2.x, some xAI variants, several local OpenAI-compat
+        # servers) reject any system message after the leading one with
+        # a "invalid message role: system" 400. Semantically the
+        # reprompt is the orchestrator-as-user nudging the consciousness
+        # to reconsider, so `user` is also the more accurate role.
+        messages.append(Message(role=Role.user, content=REPROMPT_INSTRUCTION))
 
     raise RuntimeError(
         "bicameral loop exited without producing a final message — should be unreachable"
