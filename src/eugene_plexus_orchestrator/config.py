@@ -29,6 +29,7 @@ REDACTED = "<redacted>"
 CATEGORY_LABELS: dict[str, str] = {
     "topology": "Drivers",
     "memory": "Memory Service",
+    "identity": "Identity Service",
     "network": "Network",
     "logging": "Logging",
     "bicameral": "Bicameral Loop",
@@ -84,6 +85,24 @@ FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.url,
         default="http://127.0.0.1:8083",
         required=True,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="identityUrl",
+        label="Identity service URL",
+        description=(
+            "HTTP base of the running `eugene-plexus/identity` service — "
+            "Eugene's constitution + self-model + person registry. When "
+            "set, the orchestrator pulls constitution + relevant "
+            "self-model entries + the speaker's relationship summary on "
+            "every chat turn and assembles per-hemisphere system prompts "
+            "from them. Leave unset to fall back to v0.1's single "
+            "shared-system-prompt path (uses `defaultSystemPrompt`)."
+        ),
+        category="identity",
+        valueType=ConfigValueType.url,
+        default=None,
+        required=False,
         requiresRestart=True,
     ),
     # The orchestrator's bind port used to live here. It moved out:

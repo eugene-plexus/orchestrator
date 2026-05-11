@@ -14,6 +14,7 @@ from .auth_state import AuthState, load_auth_state
 from .config import ConfigStore
 from .dependencies import require_authorized, require_operator
 from .hemisphere_client import HemisphereClient, HttpHemisphereClient
+from .identity import HttpIdentity, IdentityClient
 from .memory import HttpMemory, MemoryClient
 from .routes import admin as admin_routes
 from .routes import chat as chat_routes
@@ -73,6 +74,26 @@ def build_memory(store: ConfigStore, auth_state: AuthState) -> tuple[MemoryClien
     )
 
 
+def build_identity(
+    store: ConfigStore, auth_state: AuthState
+) -> tuple[IdentityClient, str] | None:
+    """Construct the identity client from config. Returns None when
+    `identityUrl` isn't configured — the chat handler falls back to the
+    v0.1 single-shared-system-prompt path in that case."""
+    raw = store.get("identityUrl")
+    if not raw:
+        return None
+    identity_url = str(raw)
+    return (
+        HttpIdentity(
+            base_url=identity_url,
+            timeout_seconds=30.0,
+            service_token=auth_state.service_token,
+        ),
+        identity_url,
+    )
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
@@ -123,6 +144,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_memory = False
         app.state.memory_url = getattr(app.state, "memory_url", "")
 
+    # Identity is optional: when unconfigured the chat handler falls back
+    # to the v0.1 prompt-building path. Mirrors the memory-injection
+    # pattern so tests can pre-populate `app.state.identity`.
+    if not hasattr(app.state, "identity"):
+        if settings.safe_mode:
+            app.state.identity = None
+            app.state.identity_url = ""
+            owns_identity = False
+        else:
+            built = build_identity(store, auth_state)
+            if built is None:
+                app.state.identity = None
+                app.state.identity_url = ""
+                owns_identity = False
+            else:
+                identity, identity_url = built
+                app.state.identity = identity
+                app.state.identity_url = identity_url
+                owns_identity = True
+    else:
+        owns_identity = False
+        app.state.identity_url = getattr(app.state, "identity_url", "")
+
     if not hasattr(app.state, "drivers"):
         # Defaults have no `drivers` configured; build_clients returns []
         # in safe mode anyway, but skip the call for clarity.
@@ -136,6 +180,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if owns_memory:
             await app.state.memory.aclose()
+        if owns_identity and app.state.identity is not None:
+            await app.state.identity.aclose()
         if owns_clients:
             for client in app.state.drivers:
                 await client.aclose()

@@ -81,7 +81,8 @@ def _preview(text: str, *, limit: int = _DEBUG_PREVIEW_CHARS) -> str:
 
 async def run_bicameral_loop(
     *,
-    initial_messages: list[Message],
+    history: list[Message],
+    system_prompts: dict[str, str],
     drivers: list[HemisphereClient],
     nt_state: NTState,
     max_passes: int,
@@ -90,6 +91,14 @@ async def run_bicameral_loop(
     max_tokens: int | None,
 ) -> BicameralOutcome:
     """Drive the bicameral loop for a single user turn.
+
+    `history` is the shared conversation history — user / assistant
+    messages, no system message. Each driver sees the same history.
+
+    `system_prompts` maps driver name to that driver's system message
+    content. v0.2's identity-assembled prompts give each hemisphere a
+    distinct preamble identifying which side it is and what model its
+    twin is running — see `chat.py::_build_per_driver_system_prompts`.
 
     `temperature` and `max_tokens` are applied to every `GenerateRequest`
     built here. The orchestrator owns LLM-output-affecting parameters; the
@@ -108,14 +117,31 @@ async def run_bicameral_loop(
         )
     left, right = drivers[0], drivers[1]
 
-    passes: list[PassRecord] = []
-    messages: list[Message] = list(initial_messages)
+    for driver in drivers:
+        if driver.name not in system_prompts:
+            raise ValueError(
+                f"system_prompts is missing an entry for driver {driver.name!r}; "
+                f"got keys {sorted(system_prompts)}"
+            )
 
-    for pass_index in range(max_passes):
-        # Build the cross-spec GenerateRequest by serializing through dict.
-        # The orchestrator.yaml and hemisphere-driver.yaml each have their
-        # own generated Message / NTState classes (same wire shape, distinct
-        # Python types because we keep the two model modules independent).
+    passes: list[PassRecord] = []
+    # `intermediate` carries between-pass content shared across drivers:
+    # the hemisphere outputs from prior passes plus the reprompt
+    # nudges. Each driver's outgoing message list = [system(theirs)] +
+    # history + intermediate.
+    intermediate: list[Message] = []
+
+    def _build_messages_for(driver: HemisphereClient) -> list[Message]:
+        out: list[Message] = []
+        sys_prompt = system_prompts[driver.name]
+        if sys_prompt:
+            out.append(Message(role=Role.system, content=sys_prompt))
+        out.extend(history)
+        out.extend(intermediate)
+        return out
+
+    def _build_request_for(driver: HemisphereClient, pass_index: int) -> GenerateRequest:
+        messages = _build_messages_for(driver)
         request_payload: dict[str, object] = {
             "messages": [m.model_dump(mode="json", exclude_none=True) for m in messages],
             "ntState": nt_state.model_dump(exclude_none=True),
@@ -125,23 +151,33 @@ async def run_bicameral_loop(
             request_payload["temperature"] = temperature
         if max_tokens is not None:
             request_payload["maxTokens"] = max_tokens
-        gen_request = GenerateRequest.model_validate(request_payload)
+        return GenerateRequest.model_validate(request_payload)
+
+    for pass_index in range(max_passes):
+        # Build the cross-spec GenerateRequest by serializing through dict.
+        # The orchestrator.yaml and hemisphere-driver.yaml each have their
+        # own generated Message / NTState classes (same wire shape, distinct
+        # Python types because we keep the two model modules independent).
+        left_request = _build_request_for(left, pass_index)
+        right_request = _build_request_for(right, pass_index)
 
         log.debug("bicameral pass %d: dispatching to %d drivers", pass_index, len(drivers))
         if log.isEnabledFor(logging.DEBUG):
-            for i, m in enumerate(messages):
-                log.debug(
-                    "  pass %d outgoing[%d] role=%s%s content=%s",
-                    pass_index,
-                    i,
-                    m.role.value,
-                    f" driver={m.driverName}" if m.driverName else "",
-                    _preview(m.content),
-                )
+            for driver, request in ((left, left_request), (right, right_request)):
+                for i, m in enumerate(request.messages):
+                    log.debug(
+                        "  pass %d outgoing[%s][%d] role=%s%s content=%s",
+                        pass_index,
+                        driver.name,
+                        i,
+                        m.role.value,
+                        f" driver={m.driverName}" if m.driverName else "",
+                        _preview(m.content),
+                    )
 
         left_resp, right_resp = await asyncio.gather(
-            left.generate(gen_request),
-            right.generate(gen_request),
+            left.generate(left_request),
+            right.generate(right_request),
         )
 
         if log.isEnabledFor(logging.DEBUG):
@@ -226,15 +262,15 @@ async def run_bicameral_loop(
             )
         )
 
-        messages.append(left_msg)
-        messages.append(right_msg)
+        intermediate.append(left_msg)
+        intermediate.append(right_msg)
         # REPROMPT is sent as `user` not `system` — many providers
         # (MiniMax-M2.x, some xAI variants, several local OpenAI-compat
         # servers) reject any system message after the leading one with
         # a "invalid message role: system" 400. Semantically the
         # reprompt is the orchestrator-as-user nudging the consciousness
         # to reconsider, so `user` is also the more accurate role.
-        messages.append(Message(role=Role.user, content=REPROMPT_INSTRUCTION))
+        intermediate.append(Message(role=Role.user, content=REPROMPT_INSTRUCTION))
 
     raise RuntimeError(
         "bicameral loop exited without producing a final message — should be unreachable"
