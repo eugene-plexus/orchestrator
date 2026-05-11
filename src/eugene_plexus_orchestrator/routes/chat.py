@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
@@ -10,14 +11,19 @@ from fastapi import APIRouter, HTTPException, Request, status
 from .._generated.models import (
     ChatRequest,
     ChatResponse,
+    Constitution,
     Message,
+    Person,
     Problem,
+    RelationshipSummary,
     Role,
+    SelfModelEntry,
 )
 from ..bicameral.loop import run_bicameral_loop
 from ..bicameral.nt import neutral_state
 from ..config import ConfigStore
 from ..hemisphere_client import HemisphereClient, HemisphereDriverError
+from ..identity import IdentityClient
 from ..memory import MemoryClient
 
 router = APIRouter(tags=["chat"])
@@ -25,21 +31,199 @@ router = APIRouter(tags=["chat"])
 log = logging.getLogger(__name__)
 
 
-def _build_initial_messages(
-    history: list[Message], system_prompt: str, user_message: str
-) -> list[Message]:
-    """Build the messages list to send to hemispheres for this turn."""
+def _build_history(history: list[Message], user_message: str) -> list[Message]:
+    """Conversation history to send to hemispheres for this turn.
+
+    Returns user / assistant turns plus the new user message — no system
+    prompt (the bicameral loop prepends per-driver system prompts).
+    Hemisphere-tagged intermediate messages from prior turns are
+    observability artifacts and don't belong in subsequent prompts.
+    """
     out: list[Message] = []
-    if system_prompt:
-        out.append(Message(role=Role.system, content=system_prompt))
-    # Include only user/assistant turns from history; hemisphere-tagged
-    # intermediate messages from prior turns are observability artifacts
-    # and don't belong in subsequent prompts.
     for msg in history:
         if msg.role in (Role.user, Role.assistant):
             out.append(msg)
     out.append(Message(role=Role.user, content=user_message))
     return out
+
+
+async def _resolve_operator_person_id(identity: IdentityClient) -> UUID | None:
+    """Look up the operator's personId from the identity component.
+
+    UI chat calls don't supply `personId`; the orchestrator resolves it
+    on demand. Returns None when no operator person exists yet (e.g. an
+    install whose first-run wizard hasn't run `ensure_operator`).
+    """
+    persons = await identity.list_persons()
+    for p in persons:
+        if p.isOperator:
+            return p.personId
+    return None
+
+
+def _hemisphere_preamble(this_driver: str, twin_driver: str, *, position: str) -> str:
+    """Per-hemisphere preamble identifying which side this is.
+
+    `position` is "left" or "right" — matches the operator's tab order
+    in the UI, not an anatomical claim. The twin attribution makes the
+    cross-vendor bicameral commitment visible to the model: each
+    hemisphere knows the OTHER one is running on a different backend
+    and will respond in parallel without seeing this side's output.
+    """
+    twin_position = "right" if position == "left" else "left"
+    return (
+        f"You are Eugene's {position} hemisphere, running on backend {this_driver!r}. "
+        f"Your twin (Eugene's {twin_position} hemisphere) runs on backend "
+        f"{twin_driver!r} and will respond in parallel — you don't see their "
+        "output while you think. The orchestrator (corpus callosum) blends "
+        "both responses into Eugene's final reply."
+    )
+
+
+def _render_constitution(c: Constitution) -> str:
+    parts: list[str] = []
+    parts.append(f"Your name: {c.name}.")
+    if c.pronouns:
+        parts.append(f"Pronouns: {c.pronouns}.")
+    if c.coreValues:
+        parts.append("Core values: " + "; ".join(c.coreValues) + ".")
+    if c.freeText:
+        parts.append(c.freeText.strip())
+    return "\n".join(parts)
+
+
+def _render_self_model(entries: list[SelfModelEntry]) -> str:
+    if not entries:
+        return ""
+    lines = ["What you've come to notice about yourself:"]
+    for e in entries:
+        lines.append(f"- [{e.topic}] {e.content}")
+    return "\n".join(lines)
+
+
+def _render_relationship(summary: RelationshipSummary, person: Person | None) -> str:
+    """Render relationship context for the speaker.
+
+    Prefer the synthesized `summary` when available; v0.2's default is
+    `recentTurns`-only (no summary) so fall back to a recent-turn count
+    and the operator's free-form `relationshipNote` if present.
+    """
+    parts: list[str] = []
+    if person is not None:
+        intro = f"You are talking to {person.displayName}"
+        if person.isOperator:
+            intro += " (your operator — the person who set up your install)"
+        intro += "."
+        parts.append(intro)
+        if person.relationshipNote:
+            parts.append(f"Operator note about them: {person.relationshipNote}")
+    if summary.summary:
+        parts.append(summary.summary)
+    elif summary.turnCount and summary.turnCount > 0:
+        parts.append(
+            f"You've shared {summary.turnCount} prior turn(s) with this person."
+        )
+    return "\n".join(parts)
+
+
+async def _build_per_driver_system_prompts(
+    *,
+    drivers: list[HemisphereClient],
+    identity: IdentityClient | None,
+    person_id: UUID | None,
+    operator_person_id: UUID | None,
+    user_message: str,
+    operator_override: str | None,
+    fallback_default: str,
+) -> dict[str, str]:
+    """Assemble per-hemisphere system prompts.
+
+    When `identity` is configured, each driver gets a preamble + the
+    full identity stack (constitution + self-model + relationship). When
+    identity is not configured (or fails partially), every driver gets
+    the same shared system prompt — v0.1's behavior — preceded only by
+    the hemisphere preamble.
+
+    `operator_override` is `ChatRequest.systemPrompt`. When provided, it
+    replaces the identity-assembled persona body; the per-hemisphere
+    preamble is still added on top.
+    """
+    if len(drivers) != 2:
+        # The bicameral loop enforces this too — short-circuit cleanly
+        # so the preamble generator below doesn't have to handle N!=2.
+        raise ValueError(
+            f"per-driver prompt assembly requires exactly two drivers; got {len(drivers)}"
+        )
+
+    left, right = drivers[0], drivers[1]
+    preamble_left = _hemisphere_preamble(left.name, right.name, position="left")
+    preamble_right = _hemisphere_preamble(right.name, left.name, position="right")
+
+    persona_body: str
+    if operator_override:
+        persona_body = operator_override
+    elif identity is not None:
+        # Resolve the speaker's personId: explicit body.personId wins;
+        # otherwise default to the operator (UI chat calls without a
+        # personId are by-design operator turns).
+        effective_person_id = person_id or operator_person_id
+        constitution = await identity.get_constitution()
+        # v0.2 has no topic-detection yet; pass the raw user message as
+        # the topic hint. The identity component does a starts-with /
+        # exact-match against `topic` and falls back to recency, so the
+        # full-message-as-topic produces near-recency behavior here —
+        # good enough until v0.3 adds the topic-shift detector.
+        self_model_task = identity.query_self_model(
+            topic=None,
+            person_id=effective_person_id,
+            limit=5,
+        )
+        if effective_person_id is not None:
+            relationship_task = identity.get_relationship(effective_person_id)
+            persons_task = identity.list_persons()
+        else:
+            relationship_task = None
+            persons_task = None
+        self_model_entries = await self_model_task
+        relationship = await relationship_task if relationship_task is not None else None
+        persons = await persons_task if persons_task is not None else []
+        person_record = next(
+            (p for p in persons if p.personId == effective_person_id), None
+        ) if effective_person_id is not None else None
+
+        sections: list[str] = [_render_constitution(constitution)]
+        sm_text = _render_self_model(self_model_entries)
+        if sm_text:
+            sections.append(sm_text)
+        if relationship is not None:
+            rel_text = _render_relationship(relationship, person_record)
+            if rel_text:
+                sections.append(rel_text)
+        elif person_record is not None:
+            # Person known but no relationship summary (e.g. brand new
+            # person). Still surface name + operator note so Eugene
+            # doesn't speak to them generically.
+            intro = f"You are talking to {person_record.displayName}"
+            if person_record.isOperator:
+                intro += " (your operator — the person who set up your install)"
+            intro += "."
+            if person_record.relationshipNote:
+                intro += f"\nOperator note about them: {person_record.relationshipNote}"
+            sections.append(intro)
+        persona_body = "\n\n".join(s for s in sections if s)
+    else:
+        # v0.1 fallback path — no identity component configured.
+        persona_body = fallback_default
+
+    # Reference user_message to keep mypy happy even though we don't (yet)
+    # synthesize per-turn topic queries from it. v0.3's topic-shift
+    # detector will consume this.
+    _ = user_message
+
+    return {
+        left.name: f"{preamble_left}\n\n{persona_body}".strip(),
+        right.name: f"{preamble_right}\n\n{persona_body}".strip(),
+    }
 
 
 @router.post("/v1/chat", response_model=ChatResponse)
@@ -67,6 +251,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     store: ConfigStore = request.app.state.config_store
     memory: MemoryClient = request.app.state.memory
     drivers: list[HemisphereClient] = request.app.state.drivers
+    identity: IdentityClient | None = getattr(request.app.state, "identity", None)
 
     try:
         if body.conversationId is not None:
@@ -88,7 +273,6 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             conversation_id = await memory.create()
             history = []
 
-        system_prompt = body.systemPrompt or str(store.get("defaultSystemPrompt") or "")
         user_message = Message(role=Role.user, content=body.message)
         await memory.append(conversation_id, user_message)
     except httpx.HTTPError as e:
@@ -104,7 +288,52 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             ).model_dump(exclude_none=True),
         ) from e
 
-    initial_messages = _build_initial_messages(history, system_prompt, body.message)
+    # Resolve speaker. body.personId wins; otherwise fall back to the
+    # operator's personId from identity. UI chat calls have no personId
+    # by design — they're always operator turns.
+    operator_person_id: UUID | None = None
+    if identity is not None and body.personId is None:
+        try:
+            operator_person_id = await _resolve_operator_person_id(identity)
+        except httpx.HTTPError as e:
+            log.warning(
+                "identity service unreachable while resolving operator: %s "
+                "(falling back to no-person-context path)",
+                e,
+            )
+            # Don't fail the chat turn just because identity is down —
+            # degrade to no-person-context and continue.
+            operator_person_id = None
+
+    try:
+        system_prompts = await _build_per_driver_system_prompts(
+            drivers=drivers,
+            identity=identity,
+            person_id=body.personId,
+            operator_person_id=operator_person_id,
+            user_message=body.message,
+            operator_override=body.systemPrompt,
+            fallback_default=str(store.get("defaultSystemPrompt") or ""),
+        )
+    except httpx.HTTPError as e:
+        log.warning(
+            "identity service unreachable while assembling system prompts: %s "
+            "(falling back to defaultSystemPrompt)",
+            e,
+        )
+        # Identity is down mid-assembly. Use defaultSystemPrompt for both
+        # hemispheres (still with the per-hemisphere preamble) and
+        # continue — chat works even with identity offline.
+        left, right = drivers[0], drivers[1]
+        fallback = body.systemPrompt or str(store.get("defaultSystemPrompt") or "")
+        left_preamble = _hemisphere_preamble(left.name, right.name, position="left")
+        right_preamble = _hemisphere_preamble(right.name, left.name, position="right")
+        system_prompts = {
+            left.name: f"{left_preamble}\n\n{fallback}".strip(),
+            right.name: f"{right_preamble}\n\n{fallback}".strip(),
+        }
+
+    history_for_drivers = _build_history(history, body.message)
 
     nt_at_start = neutral_state()
     max_passes = int(body.maxPasses or store.get("defaultMaxPasses") or 3)
@@ -118,7 +347,8 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
 
     try:
         outcome = await run_bicameral_loop(
-            initial_messages=initial_messages,
+            history=history_for_drivers,
+            system_prompts=system_prompts,
             drivers=drivers,
             nt_state=nt_at_start,
             max_passes=max_passes,

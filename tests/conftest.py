@@ -22,6 +22,7 @@ from eugene_plexus_orchestrator._generated.hemisphere_models import (
     GenerateResponse,
 )
 from eugene_plexus_orchestrator.app import create_app
+from eugene_plexus_orchestrator.identity import InProcessIdentity
 from eugene_plexus_orchestrator.memory import InProcessMemory
 from eugene_plexus_orchestrator.settings import Settings
 
@@ -100,11 +101,23 @@ def app(
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> FastAPI:
+    """Default app: drivers + memory wired, identity OFF.
+
+    Tests that need identity wired in build their own app via
+    `make_app_with_identity` or set `app.state.identity` directly.
+    """
     app = create_app(settings=settings)
     app.state.drivers = [left_fake, right_fake]
     app.state.memory = InProcessMemory()
     app.state.memory_url = "in-process"
+    app.state.identity = None
+    app.state.identity_url = ""
     return app
+
+
+@pytest.fixture
+def in_process_identity() -> InProcessIdentity:
+    return InProcessIdentity()
 
 
 @pytest.fixture

@@ -75,11 +75,17 @@ def test_admin_drivers_probe_rejects_invalid_url(client: TestClient) -> None:
 
 
 def test_admin_nt_state_returns_neutral_baseline(client: TestClient) -> None:
+    """v0.2 NT shape: per-NT {level, baseline, decay} triple plus
+    `lastUpdated`. Six NTs — cortisol replaces v0.1's glutamate (the
+    real modulation work this spec change enables lands next-phase)."""
     response = client.get("/v1/admin/nt-state")
     assert response.status_code == 200
     body = response.json()
-    for key in ("serotonin", "dopamine", "norepinephrine", "acetylcholine", "gaba", "glutamate"):
-        assert body[key] == 0.5
+    assert "lastUpdated" in body
+    for key in ("serotonin", "dopamine", "norepinephrine", "acetylcholine", "gaba", "cortisol"):
+        assert body[key] == {"level": 0.5, "baseline": 0.5, "decay": 0.0}
+    # v0.1's glutamate is gone in v0.2.
+    assert "glutamate" not in body
 
 
 def test_admin_restart_returns_202_and_schedules_exit(

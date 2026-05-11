@@ -37,9 +37,15 @@ SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{re
 # transitively pulls components/common.yaml types into its own module —
 # we live with the duplication of common types between the two modules
 # rather than introducing shared-code coupling.
-SPECS_TO_GENERATE = [
-    ("openapi/orchestrator.yaml", "models.py"),
-    ("openapi/hemisphere-driver.yaml", "hemisphere_models.py"),
+#
+# Identity types (Constitution, SelfModelEntry, Person, RelationshipSummary)
+# are NOT generated as a third module: they're already pulled into
+# models.py via common.yaml's transitive closure, and the orchestrator
+# only ever decodes identity responses (never serializes paths from
+# identity.yaml directly).
+SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
+    ("openapi/orchestrator.yaml", "models.py", None),
+    ("openapi/hemisphere-driver.yaml", "hemisphere_models.py", None),
 ]
 
 
@@ -101,7 +107,7 @@ def run_codegen(specs_root: Path, ref: str) -> None:
 
     write_init(GENERATED_DIR, ref)
 
-    for input_rel, output_name in SPECS_TO_GENERATE:
+    for input_rel, output_name, scopes in SPECS_TO_GENERATE:
         input_path = specs_root / input_rel
         if not input_path.is_file():
             sys.exit(f"error: expected {input_path} in extracted specs tarball")
@@ -130,6 +136,9 @@ def run_codegen(specs_root: Path, ref: str) -> None:
             "--collapse-root-models",
             "--disable-timestamp",
         ]
+        if scopes:
+            cmd.append("--openapi-scopes")
+            cmd.extend(scopes)
         subprocess.run(cmd, check=True)
 
 
