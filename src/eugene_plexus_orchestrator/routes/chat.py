@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
-from uuid import UUID
+from datetime import UTC, datetime
+from typing import Any
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
@@ -12,6 +14,7 @@ from .._generated.models import (
     ChatRequest,
     ChatResponse,
     Constitution,
+    MemoryEntry,
     Message,
     Person,
     Problem,
@@ -24,7 +27,7 @@ from ..bicameral.nt import neutral_state
 from ..config import ConfigStore
 from ..hemisphere_client import HemisphereClient, HemisphereDriverError
 from ..identity import IdentityClient
-from ..memory import MemoryClient
+from ..memory import NIL_PERSON_ID, MemoryClient
 
 router = APIRouter(tags=["chat"])
 
@@ -59,6 +62,56 @@ async def _resolve_operator_person_id(identity: IdentityClient) -> UUID | None:
         if p.isOperator:
             return p.personId
     return None
+
+
+def _build_memory_entry(
+    *,
+    conversation_id: UUID,
+    person_id: UUID,
+    message: Message,
+    nt_snapshot: Any = None,
+    hemisphere_attribution: str | None = None,
+) -> MemoryEntry:
+    """Wrap a `Message` in a `MemoryEntry` with full v0.2 metadata.
+
+    Callers always know `conversation_id` (URL) and `person_id` (body
+    or operator fallback). The orchestrator is the source of truth for
+    NT snapshot and hemisphere attribution — the memory component
+    stores both as opaque blobs.
+    """
+    return MemoryEntry(
+        entryId=uuid4(),
+        personId=person_id,
+        conversationId=conversation_id,
+        role=message.role,
+        content=message.content,
+        timestamp=message.timestamp or datetime.now(UTC),
+        ntStateSnapshot=nt_snapshot,
+        hemisphereAttribution=hemisphere_attribution,
+    )
+
+
+def _render_recent_turns(entries: list[MemoryEntry]) -> str:
+    """Render recent memory turns as a compact prompt section.
+
+    The orchestrator pulls these for the speaker's `personId` and
+    injects them into per-hemisphere prompts so Eugene has concrete
+    context (not just identity's relationship summary). Each entry
+    surfaces as one line; the bicameral loop already supplies the full
+    user/assistant turns via `history`, so we omit any entry whose
+    timestamp is in the active conversation — those are already in
+    scope.
+    """
+    if not entries:
+        return ""
+    # Newest first → reverse for readability (oldest mention first).
+    lines = ["Recent turns with this person (oldest first):"]
+    for e in reversed(entries):
+        label = "you" if e.role == Role.assistant else "they"
+        # Truncate per-entry to keep the prompt bounded.
+        content = e.content if len(e.content) <= 280 else e.content[:280] + "…"
+        lines.append(f"- {label}: {content}")
+    return "\n".join(lines)
 
 
 def _hemisphere_preamble(this_driver: str, twin_driver: str, *, position: str) -> str:
@@ -135,6 +188,7 @@ async def _build_per_driver_system_prompts(
     user_message: str,
     operator_override: str | None,
     fallback_default: str,
+    recent_turns: list[MemoryEntry] | None = None,
 ) -> dict[str, str]:
     """Assemble per-hemisphere system prompts.
 
@@ -215,6 +269,15 @@ async def _build_per_driver_system_prompts(
         # v0.1 fallback path — no identity component configured.
         persona_body = fallback_default
 
+    # Append recent-turns context (the memory-side enrichment, separate
+    # from identity's constitution/self-model). Skipped when empty or
+    # when the operator override is suppressing the persona body —
+    # operator override is an explicit "don't enrich" signal.
+    if recent_turns and not operator_override:
+        recent_section = _render_recent_turns(recent_turns)
+        if recent_section:
+            persona_body = f"{persona_body}\n\n{recent_section}".strip()
+
     # Reference user_message to keep mypy happy even though we don't (yet)
     # synthesize per-turn topic queries from it. v0.3's topic-shift
     # detector will consume this.
@@ -253,6 +316,27 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     drivers: list[HemisphereClient] = request.app.state.drivers
     identity: IdentityClient | None = getattr(request.app.state, "identity", None)
 
+    # Resolve speaker before any memory writes so we can stamp every
+    # MemoryEntry with the right personId. body.personId wins; otherwise
+    # fall back to the operator's personId from identity. UI chat calls
+    # have no personId by design — they're always operator turns.
+    operator_person_id: UUID | None = None
+    if identity is not None and body.personId is None:
+        try:
+            operator_person_id = await _resolve_operator_person_id(identity)
+        except httpx.HTTPError as e:
+            log.warning(
+                "identity service unreachable while resolving operator: %s "
+                "(falling back to no-person-context path)",
+                e,
+            )
+            # Don't fail the chat turn just because identity is down —
+            # degrade to no-person-context and continue.
+            operator_person_id = None
+    effective_person_id = body.personId or operator_person_id or NIL_PERSON_ID
+
+    nt_at_start = neutral_state()
+
     try:
         if body.conversationId is not None:
             existing = await memory.get(body.conversationId)
@@ -274,7 +358,15 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             history = []
 
         user_message = Message(role=Role.user, content=body.message)
-        await memory.append(conversation_id, user_message)
+        await memory.append_entry(
+            conversation_id,
+            _build_memory_entry(
+                conversation_id=conversation_id,
+                person_id=effective_person_id,
+                message=user_message,
+                nt_snapshot=nt_at_start,
+            ),
+        )
     except httpx.HTTPError as e:
         log.warning("memory service unreachable: %s", e)
         raise HTTPException(
@@ -288,22 +380,30 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             ).model_dump(exclude_none=True),
         ) from e
 
-    # Resolve speaker. body.personId wins; otherwise fall back to the
-    # operator's personId from identity. UI chat calls have no personId
-    # by design — they're always operator turns.
-    operator_person_id: UUID | None = None
-    if identity is not None and body.personId is None:
+    # Pull recent turns with this person from memory — feeds the
+    # relationship-context section of the per-hemisphere prompts. Skip
+    # for NIL_PERSON_ID (we'd just get unrelated NIL-bucket entries).
+    # Failure here degrades silently: prompts still get built without
+    # the recent-turns section.
+    recent_with_person: list[MemoryEntry] = []
+    if effective_person_id != NIL_PERSON_ID:
         try:
-            operator_person_id = await _resolve_operator_person_id(identity)
+            recent_with_person = await memory.person_recent(
+                effective_person_id,
+                limit=int(store.get("personRecentLimit") or 10),
+                # Exclude the active conversation — its turns are already
+                # in `history` and don't need to be replayed as ambient
+                # context.
+            )
+            recent_with_person = [
+                e for e in recent_with_person if e.conversationId != conversation_id
+            ]
         except httpx.HTTPError as e:
             log.warning(
-                "identity service unreachable while resolving operator: %s "
-                "(falling back to no-person-context path)",
+                "memory service unreachable while fetching person_recent: %s "
+                "(continuing without recent-turns context)",
                 e,
             )
-            # Don't fail the chat turn just because identity is down —
-            # degrade to no-person-context and continue.
-            operator_person_id = None
 
     try:
         system_prompts = await _build_per_driver_system_prompts(
@@ -314,6 +414,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             user_message=body.message,
             operator_override=body.systemPrompt,
             fallback_default=str(store.get("defaultSystemPrompt") or ""),
+            recent_turns=recent_with_person,
         )
     except httpx.HTTPError as e:
         log.warning(
@@ -405,7 +506,16 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         ) from e
 
     try:
-        await memory.append(conversation_id, outcome.final_message)
+        await memory.append_entry(
+            conversation_id,
+            _build_memory_entry(
+                conversation_id=conversation_id,
+                person_id=effective_person_id,
+                message=outcome.final_message,
+                nt_snapshot=nt_at_start,
+                hemisphere_attribution="blended",
+            ),
+        )
     except httpx.HTTPError as e:
         log.warning("memory service unreachable while persisting reply: %s", e)
         raise HTTPException(
