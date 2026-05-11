@@ -153,9 +153,20 @@ async def test_http_append_404_returns_none() -> None:
 
 
 async def test_http_append_201_returns_message() -> None:
+    """v0.2 memory always returns a MemoryEntry on success — the legacy
+    `append` method projects it back to a Message for backward compat."""
+    from datetime import UTC, datetime
+
     cid = uuid4()
-    payload = Message(role=Role.user, content="hi").model_dump(mode="json")
-    fake = _route("POST", f"/v1/conversations/{cid}/messages", 201, payload)
+    server_response = {
+        "entryId": str(uuid4()),
+        "personId": "00000000-0000-0000-0000-000000000000",
+        "conversationId": str(cid),
+        "role": "user",
+        "content": "hi",
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    fake = _route("POST", f"/v1/conversations/{cid}/messages", 201, server_response)
     mem = _http_memory_with(fake)
     try:
         written = await mem.append(cid, Message(role=Role.user, content="hi"))

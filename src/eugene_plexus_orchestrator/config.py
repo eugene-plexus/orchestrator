@@ -126,6 +126,23 @@ FIELDS: list[ConfigField] = [
         requiresRestart=True,
     ),
     ConfigField(
+        key="personRecentLimit",
+        label="Per-person recent-turns context",
+        description=(
+            "How many recent memory entries with the speaker to inject "
+            "into each chat turn's per-hemisphere prompts. 0 disables. "
+            "v0.2 pulls these raw from memory (skip-extraction); v0.3 "
+            "adds reactive synthesis via the topic-shift detector. "
+            "Higher values give Eugene more concrete relationship "
+            "context at the cost of token budget."
+        ),
+        category="memory",
+        valueType=ConfigValueType.integer,
+        default=10,
+        minimum=0,
+        maximum=200,
+    ),
+    ConfigField(
         key="defaultMaxPasses",
         label="Default max passes",
         description=(
