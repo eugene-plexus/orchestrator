@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI
 
 from . import __version__
 from .auth_state import AuthState, load_auth_state
+from .bicameral.nt import neutral_state
 from .config import ConfigStore
 from .dependencies import require_authorized, require_operator
 from .hemisphere_client import HemisphereClient, HttpHemisphereClient
@@ -113,6 +114,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         store.load()
     app.state.config_store = store
     app.state.safe_mode = settings.safe_mode
+
+    # v0.2 NT state. In-memory only — a restart resets Eugene to neutral
+    # (matches "anatomy cools down after a reboot"). The chat handler
+    # reads + ticks this per turn; `/v1/admin/nt-state` surfaces it.
+    if not hasattr(app.state, "nt_state"):
+        app.state.nt_state = neutral_state()
 
     # v0.2 auth state. Tests can pre-populate `app.state.auth_state` to
     # exercise authed paths; the default lifespan build reads env vars

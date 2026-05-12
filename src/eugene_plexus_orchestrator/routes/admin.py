@@ -18,7 +18,6 @@ from .._generated.models import (
     Problem,
     RestartResult,
 )
-from ..bicameral.nt import neutral_state
 from ..hemisphere_client import HemisphereClient, HttpHemisphereClient
 
 router = APIRouter(tags=["admin"])
@@ -119,8 +118,11 @@ async def probe_driver(request: Request, body: DriverEntry) -> DriverHealth:
 
 
 @router.get("/v1/admin/nt-state", response_model=NTState)
-async def get_nt_state() -> NTState:
-    return neutral_state()
+async def get_nt_state(request: Request) -> NTState:
+    """Return the live NT state. Mutated by the chat handler on every
+    turn; reset to neutral on process restart (in-memory only)."""
+    state: NTState = request.app.state.nt_state
+    return state
 
 
 # Long enough for the 202 response body to flush back to the client over
