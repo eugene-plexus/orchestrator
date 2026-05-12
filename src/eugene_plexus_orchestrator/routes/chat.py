@@ -16,14 +16,20 @@ from .._generated.models import (
     Constitution,
     MemoryEntry,
     Message,
+    NTState,
     Person,
     Problem,
     RelationshipSummary,
     Role,
     SelfModelEntry,
 )
-from ..bicameral.loop import run_bicameral_loop
-from ..bicameral.nt import neutral_state
+from ..bicameral.loop import BicameralOutcome, run_bicameral_loop
+from ..bicameral.nt import (
+    Observations,
+    modulated_max_passes,
+    modulated_temperature,
+    tick,
+)
 from ..config import ConfigStore
 from ..hemisphere_client import HemisphereClient, HemisphereDriverError
 from ..identity import IdentityClient
@@ -88,6 +94,33 @@ def _build_memory_entry(
         timestamp=message.timestamp or datetime.now(UTC),
         ntStateSnapshot=nt_snapshot,
         hemisphereAttribution=hemisphere_attribution,
+    )
+
+
+def _build_observations(
+    outcome: BicameralOutcome, agreement_threshold: float
+) -> Observations:
+    """Distill the bicameral outcome into NT-system observations.
+
+    Final-pass agreement, whether termination was convergence vs cap,
+    and average pass latency are the v0.2 observables. The active
+    `agreement_threshold` rides along so the NT system can interpret
+    `final_agreement` relative to the bar the operator set, not
+    against a hardcoded 0.5.
+    """
+    final_callosum = outcome.passes[-1].callosum
+    final_agreement = final_callosum.agreement
+    pass_count = len(outcome.passes)
+    avg_latency_ms = (
+        sum(outcome.pass_latencies_ms) / len(outcome.pass_latencies_ms)
+        if outcome.pass_latencies_ms
+        else 0.0
+    )
+    return Observations(
+        final_agreement=final_agreement,
+        pass_count=pass_count,
+        agreement_threshold=agreement_threshold,
+        avg_pass_latency_ms=avg_latency_ms,
     )
 
 
@@ -335,7 +368,12 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             operator_person_id = None
     effective_person_id = body.personId or operator_person_id or NIL_PERSON_ID
 
-    nt_at_start = neutral_state()
+    # NT state evolves across turns; the chat handler reads the current
+    # state, decays it by elapsed time (handled inside `tick`), and
+    # writes back the post-turn state at the end. v0.3+ will surface
+    # this in the response so the UI can show the cognitive arc of a
+    # conversation; v0.2 just modulates the bicameral loop with it.
+    nt_at_start: NTState = request.app.state.nt_state
 
     try:
         if body.conversationId is not None:
@@ -436,15 +474,19 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
 
     history_for_drivers = _build_history(history, body.message)
 
-    nt_at_start = neutral_state()
-    max_passes = int(body.maxPasses or store.get("defaultMaxPasses") or 3)
+    base_max_passes = int(body.maxPasses or store.get("defaultMaxPasses") or 3)
     agreement_threshold = float(store.get("agreementThreshold") or 0.5)
-    # LLM-output-affecting params are owned by the orchestrator. v0.1 reads
-    # static defaults from config; v0.2+ will derive them from NT state.
     temperature_cfg = store.get("defaultTemperature")
-    temperature = float(temperature_cfg) if temperature_cfg is not None else None
+    base_temperature = float(temperature_cfg) if temperature_cfg is not None else None
     max_tokens_cfg = store.get("defaultMaxTokens")
     max_tokens = int(max_tokens_cfg) if max_tokens_cfg is not None else None
+
+    # NT-modulated parameters. Anxious / alert Eugene gets more passes
+    # (cortisol + NE); dopamine / GABA stretch / compress temperature.
+    # Anything not modulatable in v0.2 (max_tokens, agreement_threshold)
+    # passes through unchanged.
+    max_passes = modulated_max_passes(nt_at_start, base_max_passes)
+    temperature = modulated_temperature(nt_at_start, base_temperature)
 
     try:
         outcome = await run_bicameral_loop(
@@ -505,6 +547,16 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             ).model_dump(exclude_none=True),
         ) from e
 
+    # Evolve NT state from the turn's observations and store it back —
+    # next turn will read the post-turn state. The new state is also
+    # what gets stamped on Eugene's reply MemoryEntry so the NT
+    # snapshot reflects the state at the END of the turn (the state
+    # that produced this output is more useful for analysis than the
+    # state that started the turn).
+    observations = _build_observations(outcome, agreement_threshold)
+    nt_at_end = tick(nt_at_start, observations=observations)
+    request.app.state.nt_state = nt_at_end
+
     try:
         await memory.append_entry(
             conversation_id,
@@ -512,7 +564,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
                 conversation_id=conversation_id,
                 person_id=effective_person_id,
                 message=outcome.final_message,
-                nt_snapshot=nt_at_start,
+                nt_snapshot=nt_at_end,
                 hemisphere_attribution="blended",
             ),
         )
@@ -534,7 +586,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         message=outcome.final_message,
         passes=outcome.passes,
         ntStateAtStart=nt_at_start,
-        ntStateAtEnd=nt_at_start,
+        ntStateAtEnd=nt_at_end,
         requestId=body.requestId,
     )
 

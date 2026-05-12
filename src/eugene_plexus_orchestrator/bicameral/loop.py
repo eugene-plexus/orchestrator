@@ -57,10 +57,16 @@ class BicameralPairRequired(RuntimeError):
 
 @dataclass
 class BicameralOutcome:
-    """Result of running the bicameral loop for one turn."""
+    """Result of running the bicameral loop for one turn.
+
+    `pass_latencies_ms` is the max-of-hemispheres latency for each
+    pass (parallel dispatch → the pass takes as long as the slower
+    hemisphere). The NT system reads this to nudge norepinephrine.
+    """
 
     final_message: Message
     passes: list[PassRecord]
+    pass_latencies_ms: list[int]
 
 
 # Max characters per message preview in DEBUG-level traces. Long enough
@@ -125,6 +131,7 @@ async def run_bicameral_loop(
             )
 
     passes: list[PassRecord] = []
+    pass_latencies_ms: list[int] = []
     # `intermediate` carries between-pass content shared across drivers:
     # the hemisphere outputs from prior passes plus the reprompt
     # nudges. Each driver's outgoing message list = [system(theirs)] +
@@ -179,6 +186,12 @@ async def run_bicameral_loop(
             left.generate(left_request),
             right.generate(right_request),
         )
+
+        # Pass latency = the slower hemisphere's contribution (they ran
+        # in parallel; the pass took as long as whichever finished last).
+        # Defaults to 0 when a driver doesn't report latency.
+        pass_latency = max(left_resp.latencyMs or 0, right_resp.latencyMs or 0)
+        pass_latencies_ms.append(pass_latency)
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
@@ -249,7 +262,11 @@ async def run_bicameral_loop(
                 decision.value,
             )
             log.debug("  pass %d blended: %s", pass_index, _preview(blended_text))
-            return BicameralOutcome(final_message=blended_msg, passes=passes)
+            return BicameralOutcome(
+                final_message=blended_msg,
+                passes=passes,
+                pass_latencies_ms=pass_latencies_ms,
+            )
 
         passes.append(
             PassRecord(
