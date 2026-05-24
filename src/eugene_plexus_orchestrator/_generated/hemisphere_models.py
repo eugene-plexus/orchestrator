@@ -868,6 +868,10 @@ class ConfigField(BaseModel):
     enumValues: list[str] | None = Field(
         None, description='Allowed values when `valueType == enum`.'
     )
+    suggestions: list[str] | None = Field(
+        None,
+        description="Discovery-time hints — values the operator might want\nbut which AREN'T enforced by validation. UIs render\nstring-typed fields with non-empty `suggestions` as a\ncombobox (free-text input with a dropdown of suggestions)\nrather than a strict dropdown. Use when the set of\nvalid values is large, partially-discoverable, or\nextends beyond what the component knows at the moment\n(e.g. local LLM model lists that update when the operator\npulls a new model). Distinct from `enumValues`:\nsuggestions are advisory, enumValues are mandatory.\n",
+    )
     enumLabels: list[str] | None = Field(
         None,
         description='Optional human-readable display labels paired one-to-one\nwith `enumValues`. UIs that render an enum as a dropdown\nshould show `enumLabels[i]` while still submitting\n`enumValues[i]` as the saved value. When omitted (or\nshorter than `enumValues`), UIs fall back to the raw\nvalue as the label. Useful where the stored key is\nmachine-friendly but the user-facing label isn\'t —\ne.g. `claude_subscription` saved, "Claude (Pro/Max)"\nshown.\n',

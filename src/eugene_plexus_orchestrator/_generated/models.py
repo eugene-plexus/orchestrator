@@ -757,6 +757,48 @@ class RestartResult(BaseModel):
     )
 
 
+class VoicePassRecord(BaseModel):
+    """
+    After the deliberation loop terminates (agreement or
+    cap-reached), the orchestrator runs ONE additional LLM call
+    — the "voice pass" — whose job is to convert internal
+    deliberation into a user-facing reply. The deliberation
+    hemispheres talk to each other in the loop, often slipping
+    into inner-dialog register that doesn't actually address the
+    user. The voice pass takes the deliberated content and asks
+    for a clean reply addressed to the user.
+
+    This record carries the voice pass's input + output for
+    diagnostic transparency. The `message` field on the parent
+    `ChatResponse` is the voice pass's `output` — what Eugene
+    actually said to the user.
+
+    Optional so older orchestrators that don't run a voice pass
+    keep working; v0.2.x orchestrators always emit it.
+
+    """
+
+    driverName: str = Field(
+        ...,
+        description='Which hemisphere driver performed the voice pass. Operator-\nconfigurable via `voiceDriver` on the orchestrator config;\ndefaults to the first driver in the topology.\n',
+    )
+    inputMessages: list[Message] = Field(
+        ...,
+        description='The full message list sent to the voice driver — system\nprompt + conversation history + user message + the\ninline summary of what each hemisphere considered during\ndeliberation.\n',
+    )
+    output: Message
+    latencyMs: int | None = Field(
+        None, description='Wall-clock duration of the voice pass call.', ge=0
+    )
+
+
+class HemisphereInput(BaseModel):
+    driverName: str = Field(..., description='Driver this snapshot belongs to.')
+    messages: list[Message] = Field(
+        ..., description='The full message list sent to this driver.'
+    )
+
+
 class Decision(StrEnum):
     """
     What the orchestrator did at the end of this pass.
@@ -901,6 +943,10 @@ class ConfigField(BaseModel):
     )
     enumValues: list[str] | None = Field(
         None, description='Allowed values when `valueType == enum`.'
+    )
+    suggestions: list[str] | None = Field(
+        None,
+        description="Discovery-time hints — values the operator might want\nbut which AREN'T enforced by validation. UIs render\nstring-typed fields with non-empty `suggestions` as a\ncombobox (free-text input with a dropdown of suggestions)\nrather than a strict dropdown. Use when the set of\nvalid values is large, partially-discoverable, or\nextends beyond what the component knows at the moment\n(e.g. local LLM model lists that update when the operator\npulls a new model). Distinct from `enumValues`:\nsuggestions are advisory, enumValues are mandatory.\n",
     )
     enumLabels: list[str] | None = Field(
         None,
@@ -1071,6 +1117,11 @@ class PassRecord(BaseModel):
         description="One `Message` per configured driver that responded on this\npass, in the order the orchestrator's `drivers` config\ndeclares them. Each message carries `driverName`. v0.1\nexpects exactly two entries.\n",
         min_length=1,
     )
+    hemisphereInputs: list[HemisphereInput] | None = Field(
+        None,
+        description='Diagnostic-only mirror of `hemispheres`: each entry is the\nexact message list the orchestrator built and sent to that\nhemisphere driver for this pass — system prompt, conversation\nhistory, and any cross-hemisphere intermediate content. The\nUI\'s "copy trace" feature reads this so an operator can see\nwhat each side actually saw, which is essential when one\nbackend (e.g. a CLI persona) appears to be ignoring its\nbriefing.\n\nSame ordering as `hemispheres`. Length matches `hemispheres`\nwhen present. Optional so older clients keep working —\nv0.2 orchestrators emit it; pre-v0.2 do not.\n',
+        min_length=0,
+    )
     callosum: CallosumState
 
 
@@ -1096,6 +1147,7 @@ class ChatResponse(BaseModel):
         ...,
         description='Per-pass record of what each driver said and how the corpus\ncallosum scored agreement. `passes[N].hemispheres` has one\nentry per configured driver that responded — two in v0.1.\n',
     )
+    voicePass: VoicePassRecord | None = None
     ntStateAtStart: NTState | None = None
     ntStateAtEnd: NTState | None = None
     requestId: UUID | None = None
