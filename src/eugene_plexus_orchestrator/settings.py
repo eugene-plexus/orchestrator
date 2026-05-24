@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     has logged in at the watchdog; absent during the configured-but-
     locked window. Reserved for Phase 6; Phase 3 does not consume it."""
 
+    disable_embedding_scorer: bool = False
+    """When true, the lifespan skips loading the sentence-transformer
+    agreement-scoring model and uses the Jaccard word-overlap fallback
+    directly. Tests set this to keep torch out of the test environment;
+    operators can set EUGENE_PLEXUS_ORCH_DISABLE_EMBEDDING_SCORER=1 to
+    intentionally run on the lightweight scorer on resource-constrained
+    boxes."""
+
 
 def load_settings() -> Settings:
     return Settings()

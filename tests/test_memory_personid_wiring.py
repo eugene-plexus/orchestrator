@@ -58,7 +58,9 @@ def test_chat_writes_full_memory_entries_with_resolved_personid(
     app.state.identity = InProcessIdentity(persons=[operator])
     app.state.identity_url = "in-process"
 
-    left_fake.responses = ["hi"]
+    # v0.2.x voice pass runs after deliberation; extra left response
+    # covers the voice pass call.
+    left_fake.responses = ["hi", "hi voice"]
     right_fake.responses = ["hi"]
     with TestClient(app) as client:
         response = client.post("/v1/chat", json={"message": "hello"})
@@ -73,7 +75,10 @@ def test_chat_writes_full_memory_entries_with_resolved_personid(
     assert reply_entry.personId == operator_id
     assert user_entry.role == Role.user
     assert reply_entry.role == Role.assistant
-    assert reply_entry.hemisphereAttribution == "blended"
+    # v0.2.x: the reply Eugene actually sends is the voice pass output,
+    # tagged with hemisphereAttribution="voice" instead of "blended".
+    assert reply_entry.hemisphereAttribution == "voice"
+    assert reply_entry.content == "hi voice"
     # NT snapshot present on both — gives the v0.3+ analyser something
     # to correlate output style against state.
     assert user_entry.ntStateSnapshot is not None

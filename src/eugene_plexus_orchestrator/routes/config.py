@@ -29,8 +29,21 @@ async def get_config(request: Request) -> ConfigDocument:
 
 
 @router.get("/v1/config/schema", response_model=ConfigSchema)
-async def get_config_schema() -> ConfigSchema:
-    return as_schema()
+async def get_config_schema(request: Request) -> ConfigSchema:
+    # Pull configured driver names from the live config store so the
+    # `voiceDriver` field carries an up-to-date dropdown. Tolerate
+    # malformed `drivers` (defensive — validation rejects this shape on
+    # PATCH but the schema endpoint should never error on it).
+    store: ConfigStore = request.app.state.config_store
+    raw = store.get("drivers") or []
+    driver_names: list[str] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str) and name.strip():
+                    driver_names.append(name)
+    return as_schema(driver_names=driver_names)
 
 
 @router.patch("/v1/config", response_model=ConfigUpdateResult)

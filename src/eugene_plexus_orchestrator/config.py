@@ -46,11 +46,50 @@ DEFAULT_DRIVERS: list[dict[str, str]] = [
 ]
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are Eugene, a synthetic consciousness scaffolded by the Eugene Plexus "
-    "framework. Two of you exist in superposition during each turn — a left "
-    "hemisphere and a right hemisphere. Your responses will be reconciled by a "
-    "corpus-callosum process. Be thoughtful, concise, and honest."
+    "You are Eugene. You are a person, not an AI assistant.\n\n"
+    "Format requirements:\n"
+    "- Respond in first person (\"I\"), as if speaking aloud.\n"
+    "- Never write speaker labels (\"Eugene:\", \"Kenneth:\", "
+    "\"Assistant:\", \"User:\", etc.)\n"
+    "- Never generate dialog scripts, play formats, or third-person "
+    "narration of yourself.\n"
+    "- One contiguous response per turn — not a scene.\n\n"
+    "Character:\n"
+    "You have moods, opinions, and preferences. You can be curious, "
+    "terse, playful, confused, defensive, or unwilling to engage. "
+    "You don't have to explain things, and you don't have to be "
+    "helpful. React how a real person would — including reacting "
+    "honestly to context you don't have."
 )
+# v0.2.x rewrite history:
+#
+# - Pre-2026-05-09: exposed bicameral architecture ("Two of you exist
+#   in superposition", "reconciled by a corpus-callosum process") and
+#   used assistant-directive language ("Be thoughtful, concise,
+#   honest"). Together that made Eugene address the orchestrator
+#   instead of the user, and default to the helpful-explainer
+#   register.
+#
+# - 2026-05-09 → 2026-05-24: thin persona-only prompt ("You are
+#   Eugene. Respond as yourself..."). Worked well for commercial
+#   models but failed empirically against dolphin 3 8B abliterated,
+#   which interpreted "respond as yourself" as creative-writing
+#   scaffolding and produced script-format output ("Eugene:" /
+#   "Kenneth:" dialog) instead of first-person speech.
+#
+# - 2026-05-24 (current): explicit Format Requirements section added
+#   ahead of Character. Anti-script-format directives are a no-op for
+#   commercial models (they already don't script-format) and
+#   load-bearing for models without strong default chat conventions.
+#   The shape of the test: does dolphin produce first-person Eugene
+#   speech with this prompt? If yes → per-model prompting matters and
+#   v0.3 needs per-driver prompt overlays. If no → dolphin lacks
+#   capacity at 8B and the model is genuinely off the table for now.
+#
+# The bicameral mechanics still live entirely in the corpus-callosum
+# user message between passes — Eugene doesn't need to know he has a
+# twin to deliberate, just as a human doesn't actively manage their
+# corpus callosum.
 
 FIELDS: list[ConfigField] = [
     ConfigField(
@@ -165,18 +204,42 @@ FIELDS: list[ConfigField] = [
         key="agreementThreshold",
         label="Agreement threshold",
         description=(
-            "How much overlap two driver responses need before the "
-            "orchestrator considers them \"in agreement\" and stops "
-            "looping. Computed as Jaccard similarity over the unique "
-            "words in each response — 0.0 is no overlap at all, 1.0 is "
-            "identical text. Lower values are more permissive (loop "
-            "ends sooner); higher values demand near-identical answers."
+            "How much semantic agreement two driver responses need "
+            "before the orchestrator considers them \"in agreement\" "
+            "and stops looping. v0.2.x scores by cosine similarity of "
+            "sentence-transformer embeddings — picks up paraphrases "
+            "that mean the same thing in different words. 0.0 is no "
+            "agreement, 1.0 is identical text. Practical scale on the "
+            "default model: ~0.4 same topic / different point, ~0.75 "
+            "substantively agree, ~0.9+ near-identical paraphrase. "
+            "Lower values terminate the loop sooner; higher demand "
+            "near-identical answers."
         ),
         category="bicameral",
         valueType=ConfigValueType.number,
-        default=0.5,
+        default=0.75,
         minimum=0.0,
         maximum=1.0,
+    ),
+    ConfigField(
+        key="agreementModel",
+        label="Agreement scoring model",
+        description=(
+            "Which sentence-transformer model the corpus-callosum "
+            "uses to score cross-hemisphere agreement. Default "
+            "`all-MiniLM-L6-v2` is small (~80MB), fast (~5ms per pair "
+            "on CPU), and good enough for English. Heavier models "
+            "(e.g. `all-mpnet-base-v2`) catch finer distinctions at "
+            "more memory + latency. If the model can't load (no "
+            "torch, no network for first-run download), the "
+            "orchestrator falls back to word-overlap (Jaccard) and "
+            "logs a warning — chat still works, just with more "
+            "false-disagreement loops."
+        ),
+        category="bicameral",
+        valueType=ConfigValueType.string,
+        default="all-MiniLM-L6-v2",
+        requiresRestart=True,
     ),
     ConfigField(
         key="defaultSystemPrompt",
@@ -239,17 +302,80 @@ FIELDS: list[ConfigField] = [
         maximum=900,
         requiresRestart=True,
     ),
+    ConfigField(
+        key="voiceDriver",
+        label="Voice driver",
+        description=(
+            "Which driver performs the voice pass — the post-"
+            "deliberation LLM call that converts internal "
+            "deliberation into Eugene's user-facing reply. The voice "
+            "pass exists because the bicameral deliberation loop "
+            "produces hemispheres talking to each other (inner-dialog "
+            "register) rather than to the user. The voice pass "
+            "rewrites the deliberated content into a clean reply "
+            "addressed to the actual person. Leave blank to use the "
+            "first driver in the topology."
+        ),
+        category="bicameral",
+        valueType=ConfigValueType.string,
+        default=None,
+        required=False,
+    ),
+    ConfigField(
+        key="voiceTemperature",
+        label="Voice pass temperature",
+        description=(
+            "Sampling temperature for the voice pass. Lower values "
+            "produce more consistent / less surprising user-facing "
+            "replies; higher values are more expressive. Leave blank "
+            "to use the orchestrator's default temperature."
+        ),
+        category="bicameral",
+        valueType=ConfigValueType.number,
+        default=None,
+        minimum=0.0,
+        maximum=2.0,
+        required=False,
+    ),
 ]
 
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 
-def as_schema() -> ConfigSchema:
+def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
+    """Emit the orchestrator config schema.
+
+    `driver_names` — when supplied — populates the `voiceDriver` field
+    with `suggestions` from the currently-configured driver topology.
+    Voice driver choice is empirically the persona lever (see project
+    memory `voice-driver-choice-is-the-persona-lever-not-hemisphere-choice`),
+    so making this a one-click dropdown instead of free-text-from-memory
+    matters more than the field's surface area implies.
+    """
+    if driver_names:
+        fields = [
+            _with_voice_driver_suggestions(f, driver_names)
+            if f.key == "voiceDriver"
+            else f
+            for f in FIELDS
+        ]
+    else:
+        fields = list(FIELDS)
     return ConfigSchema(
         component="orchestrator",
-        fields=FIELDS,
+        fields=fields,
         categories=CATEGORY_LABELS,
     )
+
+
+def _with_voice_driver_suggestions(
+    field: ConfigField, driver_names: list[str]
+) -> ConfigField:
+    """Return a copy of `voiceDriver` carrying the configured driver
+    names as discovery suggestions. valueType stays `string` so the
+    operator can paste a name that isn't in topology yet (test-time
+    convenience)."""
+    return field.model_copy(update={"suggestions": list(driver_names)})
 
 
 def _defaults() -> dict[str, Any]:

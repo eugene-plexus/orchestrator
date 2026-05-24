@@ -12,7 +12,10 @@ def test_chat_round_trip_when_hemispheres_agree(
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    left_fake.responses = ["hello world"]
+    # v0.2.x adds a voice pass after deliberation — one extra call to
+    # the voice driver (left by default). The voice pass output IS what
+    # the user sees; deliberation outputs are diagnostic only.
+    left_fake.responses = ["hello world", "voice reply"]
     right_fake.responses = ["hello world"]
 
     response = client.post("/v1/chat", json={"message": "hi"})
@@ -20,14 +23,21 @@ def test_chat_round_trip_when_hemispheres_agree(
     body = response.json()
 
     assert body["message"]["role"] == "assistant"
-    assert body["message"]["content"] == "hello world"
+    # User-facing reply comes from the voice pass.
+    assert body["message"]["content"] == "voice reply"
     assert body["conversationId"]
     assert len(body["passes"]) == 1
     assert body["passes"][0]["callosum"]["decision"] == "terminate"
     assert body["passes"][0]["callosum"]["agreement"] == 1.0
-    # Hemisphere messages carry the operator-supplied driver name.
+    # Hemisphere deliberation messages carry the operator-supplied
+    # driver name and the original deliberation content.
     driver_names = [m["driverName"] for m in body["passes"][0]["hemispheres"]]
     assert driver_names == ["left", "right"]
+    for m in body["passes"][0]["hemispheres"]:
+        assert m["content"] == "hello world"
+    # Voice pass record is surfaced for diagnostic transparency.
+    assert body["voicePass"]["driverName"] == "left"
+    assert body["voicePass"]["output"]["content"] == "voice reply"
 
 
 def test_chat_runs_more_passes_until_agreement(
@@ -36,7 +46,8 @@ def test_chat_runs_more_passes_until_agreement(
     right_fake: FakeHemisphereClient,
 ) -> None:
     # Pass 0: total disagreement (no shared words). Pass 1: identical.
-    left_fake.responses = ["alpha beta", "consensus reached"]
+    # Pass 2: voice pass (left only).
+    left_fake.responses = ["alpha beta", "consensus reached", "voice-final"]
     right_fake.responses = ["gamma delta", "consensus reached"]
 
     response = client.post("/v1/chat", json={"message": "hi"})
@@ -46,7 +57,9 @@ def test_chat_runs_more_passes_until_agreement(
     assert len(body["passes"]) == 2
     assert body["passes"][0]["callosum"]["decision"] == "another_pass"
     assert body["passes"][1]["callosum"]["decision"] == "terminate"
-    assert body["message"]["content"] == "consensus reached"
+    # The user-facing message is the voice pass output, not the
+    # deliberation's last-pass hemisphere reply.
+    assert body["message"]["content"] == "voice-final"
 
 
 def test_chat_caps_at_max_passes(
@@ -54,8 +67,9 @@ def test_chat_caps_at_max_passes(
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    # Always disagree; cap should kick in.
-    left_fake.responses = ["a a a", "b b b", "c c c"]
+    # Always disagree; cap should kick in. Extra entry on left for
+    # the voice pass that follows the deliberation loop.
+    left_fake.responses = ["a a a", "b b b", "c c c", "voice fallback"]
     right_fake.responses = ["x x x", "y y y", "z z z"]
 
     response = client.post("/v1/chat", json={"message": "hi", "maxPasses": 3})
@@ -64,8 +78,8 @@ def test_chat_caps_at_max_passes(
 
     assert len(body["passes"]) == 3
     assert body["passes"][-1]["callosum"]["decision"] == "cap_reached"
-    # The blended message is the final pass's blend (longer of the two).
-    assert body["message"]["content"]
+    # The user-facing message is the voice pass output.
+    assert body["message"]["content"] == "voice fallback"
 
 
 def test_chat_creates_new_conversation_when_id_omitted(

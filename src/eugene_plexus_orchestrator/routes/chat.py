@@ -22,6 +22,7 @@ from .._generated.models import (
     RelationshipSummary,
     Role,
     SelfModelEntry,
+    VoicePassRecord,
 )
 from ..bicameral.loop import BicameralOutcome, run_bicameral_loop
 from ..bicameral.nt import (
@@ -30,6 +31,7 @@ from ..bicameral.nt import (
     modulated_temperature,
     tick,
 )
+from ..bicameral.voice import run_voice_pass
 from ..config import ConfigStore
 from ..hemisphere_client import HemisphereClient, HemisphereDriverError
 from ..identity import IdentityClient
@@ -147,23 +149,27 @@ def _render_recent_turns(entries: list[MemoryEntry]) -> str:
     return "\n".join(lines)
 
 
-def _hemisphere_preamble(this_driver: str, twin_driver: str, *, position: str) -> str:
-    """Per-hemisphere preamble identifying which side this is.
+def _resolve_voice_driver(
+    drivers: list[HemisphereClient], configured_name: object
+) -> HemisphereClient:
+    """Pick which driver performs the voice pass.
 
-    `position` is "left" or "right" — matches the operator's tab order
-    in the UI, not an anatomical claim. The twin attribution makes the
-    cross-vendor bicameral commitment visible to the model: each
-    hemisphere knows the OTHER one is running on a different backend
-    and will respond in parallel without seeing this side's output.
+    Operator-configurable via `voiceDriver` on orchestrator config.
+    When unset (or set to an unknown name), defaults to the first
+    driver in the topology. Falls back gracefully — an invalid name
+    is logged as a warning but doesn't fail the chat turn.
     """
-    twin_position = "right" if position == "left" else "left"
-    return (
-        f"You are Eugene's {position} hemisphere, running on backend {this_driver!r}. "
-        f"Your twin (Eugene's {twin_position} hemisphere) runs on backend "
-        f"{twin_driver!r} and will respond in parallel — you don't see their "
-        "output while you think. The orchestrator (corpus callosum) blends "
-        "both responses into Eugene's final reply."
-    )
+    if isinstance(configured_name, str) and configured_name.strip():
+        target = configured_name.strip()
+        for driver in drivers:
+            if driver.name == target:
+                return driver
+        log.warning(
+            "voiceDriver=%r not found in topology %s; falling back to first driver",
+            target,
+            [d.name for d in drivers],
+        )
+    return drivers[0]
 
 
 def _render_constitution(c: Constitution) -> str:
@@ -243,8 +249,6 @@ async def _build_per_driver_system_prompts(
         )
 
     left, right = drivers[0], drivers[1]
-    preamble_left = _hemisphere_preamble(left.name, right.name, position="left")
-    preamble_right = _hemisphere_preamble(right.name, left.name, position="right")
 
     persona_body: str
     if operator_override:
@@ -316,9 +320,17 @@ async def _build_per_driver_system_prompts(
     # detector will consume this.
     _ = user_message
 
+    # Both hemispheres get the same persona-only system prompt. v0.2.x
+    # dropped the per-hemisphere preamble entirely — exposing the
+    # bicameral architecture in the system prompt made the LLMs address
+    # the orchestrator and treat the cross-pass content as conversation
+    # with a sibling. The cross-pass content now explains itself
+    # in-line ("you also considered:") so no preamble framing is
+    # needed up here. Per-hemisphere persona variation is planned for
+    # v0.3 (operator-selectable).
     return {
-        left.name: f"{preamble_left}\n\n{persona_body}".strip(),
-        right.name: f"{preamble_right}\n\n{persona_body}".strip(),
+        left.name: persona_body,
+        right.name: persona_body,
     }
 
 
@@ -461,15 +473,14 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             e,
         )
         # Identity is down mid-assembly. Use defaultSystemPrompt for both
-        # hemispheres (still with the per-hemisphere preamble) and
-        # continue — chat works even with identity offline.
+        # hemispheres — chat works even with identity offline. v0.2.x
+        # dropped the per-hemisphere preamble; both drivers see the
+        # same persona-only prompt.
         left, right = drivers[0], drivers[1]
         fallback = body.systemPrompt or str(store.get("defaultSystemPrompt") or "")
-        left_preamble = _hemisphere_preamble(left.name, right.name, position="left")
-        right_preamble = _hemisphere_preamble(right.name, left.name, position="right")
         system_prompts = {
-            left.name: f"{left_preamble}\n\n{fallback}".strip(),
-            right.name: f"{right_preamble}\n\n{fallback}".strip(),
+            left.name: fallback,
+            right.name: fallback,
         }
 
     history_for_drivers = _build_history(history, body.message)
@@ -498,6 +509,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             agreement_threshold=agreement_threshold,
             temperature=temperature,
             max_tokens=max_tokens,
+            scorer=request.app.state.scorer,
         )
     except HemisphereDriverError as e:
         # The driver returned a structured error — surface its actual
@@ -547,15 +559,79 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             ).model_dump(exclude_none=True),
         ) from e
 
-    # Evolve NT state from the turn's observations and store it back —
-    # next turn will read the post-turn state. The new state is also
-    # what gets stamped on Eugene's reply MemoryEntry so the NT
-    # snapshot reflects the state at the END of the turn (the state
-    # that produced this output is more useful for analysis than the
-    # state that started the turn).
+    # ----- Voice pass --------------------------------------------------
+    # The deliberation loop above produced hemispheres talking to
+    # themselves / each other. That register isn't appropriate as
+    # user-facing output. The voice pass takes the deliberated
+    # content + the user's actual message and produces Eugene's
+    # reply.
+    voice_driver = _resolve_voice_driver(drivers, store.get("voiceDriver"))
+    voice_temp_cfg = store.get("voiceTemperature")
+    voice_temperature = (
+        float(voice_temp_cfg) if voice_temp_cfg is not None else temperature
+    )
+    deliberation_finals = (
+        outcome.passes[-1].hemispheres if outcome.passes else []
+    )
+    voice_persona = system_prompts.get(voice_driver.name) or next(
+        iter(system_prompts.values()), ""
+    )
+    try:
+        voice_outcome = await run_voice_pass(
+            voice_driver=voice_driver,
+            user_message=Message(role=Role.user, content=body.message),
+            history=history,
+            system_prompt=voice_persona,
+            deliberation_finals=list(deliberation_finals),
+            nt_state=nt_at_start,
+            temperature=voice_temperature,
+            max_tokens=max_tokens,
+        )
+    except HemisphereDriverError as e:
+        log.warning(
+            "voice pass driver %r returned %d: %s",
+            e.driver_name,
+            e.status_code,
+            e.problem.detail if e.problem else e.raw_body[:200],
+        )
+        upstream = e.problem
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#voice-pass-error",
+                title="Voice pass failed",
+                status=502,
+                detail=(
+                    f"{upstream.detail if upstream else e.raw_body[:500]} "
+                    f"(driver={e.driver_name})"
+                ),
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        ) from e
+    except httpx.HTTPError as e:
+        log.warning("voice pass failed at HTTP layer: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#voice-pass-error",
+                title="Voice pass driver unreachable",
+                status=502,
+                detail=str(e),
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        ) from e
+
+    # Evolve NT state from the turn's deliberation observations and
+    # store it back — next turn will read the post-turn state. The new
+    # state is also what gets stamped on Eugene's reply MemoryEntry.
     observations = _build_observations(outcome, agreement_threshold)
     nt_at_end = tick(nt_at_start, observations=observations)
     request.app.state.nt_state = nt_at_end
+
+    # The voice pass output IS the user-facing reply. Deliberation
+    # outputs remain in `outcome.passes` for diagnostic transparency
+    # but are never the message Eugene sends back.
+    final_message = voice_outcome.output
 
     try:
         await memory.append_entry(
@@ -563,9 +639,9 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             _build_memory_entry(
                 conversation_id=conversation_id,
                 person_id=effective_person_id,
-                message=outcome.final_message,
+                message=final_message,
                 nt_snapshot=nt_at_end,
-                hemisphere_attribution="blended",
+                hemisphere_attribution="voice",
             ),
         )
     except httpx.HTTPError as e:
@@ -583,8 +659,14 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
 
     return ChatResponse(
         conversationId=conversation_id,
-        message=outcome.final_message,
+        message=final_message,
         passes=outcome.passes,
+        voicePass=VoicePassRecord(
+            driverName=voice_outcome.driver_name,
+            inputMessages=voice_outcome.input_messages,
+            output=voice_outcome.output,
+            latencyMs=voice_outcome.latency_ms,
+        ),
         ntStateAtStart=nt_at_start,
         ntStateAtEnd=nt_at_end,
         requestId=body.requestId,

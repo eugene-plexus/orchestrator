@@ -29,21 +29,69 @@ from .._generated.hemisphere_models import GenerateRequest
 from .._generated.models import (
     CallosumState,
     Decision,
+    HemisphereInput,
     Message,
     NTState,
     PassRecord,
     Role,
 )
 from ..hemisphere_client import HemisphereClient
-from .callosum import blend, jaccard_word_agreement
+from .callosum import AgreementScorer, blend
 
 log = logging.getLogger(__name__)
 
 REPROMPT_INSTRUCTION = (
-    "Your two hemispheres returned divergent responses on the previous pass. "
-    "Reconsider, taking both prior responses into account, and produce a "
-    "unified, well-reasoned answer."
+    "Now respond, accounting for both threads of thought."
 )
+# Iteration history kept for context on why each phrasing choice
+# was made:
+#   v0.2:    "Your two hemispheres returned divergent responses on
+#             the previous pass. Reconsider..." — over-asserted
+#             disagreement, spiraled into meta-debate.
+#   v0.2.x:  "Your twin hemisphere offered the perspective above.
+#             Produce a final unified answer..." — neutralized the
+#             disagreement framing, still mechanical ("twin",
+#             "produce").
+#   v0.2.x+: "(Inner voice — another version of you...) Respond as
+#             Eugene." — softened further but "another version of
+#             you" still read as a sibling the LLM could chat with.
+#   current: First-person retrospective. "You also considered, from
+#             a different angle: ..." — frames the alternative as
+#             the SAME Eugene's prior thought, not a separate
+#             interlocutor. Combined with dropping the system-prompt
+#             preamble, this stops the hemispheres from drifting
+#             into chitchat with each other.
+
+
+def _format_twin_turn(twin_driver_name: str, twin_content: str) -> str:
+    """Wrap the twin hemisphere's response in a labeled user message.
+
+    Pre-v0.2.1 the orchestrator appended both hemispheres' outputs to
+    each driver's message list as `role=hemisphere`, intending that the
+    hemisphere-driver would translate that into something the upstream
+    LLM understood as "the other side's reply". But every API adapter
+    we ship coerces `hemisphere` to `assistant` (the upstream APIs
+    only know system/user/assistant/tool). The LLM then saw TWO of its
+    own assistant turns followed by a user complaining about
+    'divergent responses' — and quite reasonably got confused, since
+    from its viewpoint there was only one mind speaking.
+
+    Fix: label the twin's response inline inside a user message. After
+    the driver's role-coercion the LLM sees its OWN prior turn as
+    `assistant` and the twin's turn as a `user` message that
+    explicitly says it came from the other hemisphere. The bicameral
+    structure is now legible on the wire.
+    """
+    # `twin_driver_name` stays in the signature for diagnostic
+    # logging and future per-hemisphere variation, but doesn't get
+    # surfaced into the prompt — exposing "driver `right`" to the
+    # LLM was part of the architecture-meta leak.
+    del twin_driver_name  # keep arg for callers; suppress unused-arg lints
+    return (
+        f"You also considered this, from a slightly different angle:\n\n"
+        f"{twin_content}\n\n"
+        f"{REPROMPT_INSTRUCTION}"
+    )
 
 
 class BicameralPairRequired(RuntimeError):
@@ -95,6 +143,7 @@ async def run_bicameral_loop(
     agreement_threshold: float,
     temperature: float | None,
     max_tokens: int | None,
+    scorer: AgreementScorer,
 ) -> BicameralOutcome:
     """Drive the bicameral loop for a single user turn.
 
@@ -132,11 +181,15 @@ async def run_bicameral_loop(
 
     passes: list[PassRecord] = []
     pass_latencies_ms: list[int] = []
-    # `intermediate` carries between-pass content shared across drivers:
-    # the hemisphere outputs from prior passes plus the reprompt
-    # nudges. Each driver's outgoing message list = [system(theirs)] +
-    # history + intermediate.
-    intermediate: list[Message] = []
+    # Per-driver intermediate. Each hemisphere needs a DIFFERENT view
+    # of the prior passes — its own response as `assistant`, the
+    # twin's response wrapped in a labeled `user` message — so the
+    # bicameral structure survives the role-coercion every upstream
+    # API adapter does. See `_format_twin_turn` for the why.
+    per_driver_intermediate: dict[str, list[Message]] = {
+        left.name: [],
+        right.name: [],
+    }
 
     def _build_messages_for(driver: HemisphereClient) -> list[Message]:
         out: list[Message] = []
@@ -144,7 +197,7 @@ async def run_bicameral_loop(
         if sys_prompt:
             out.append(Message(role=Role.system, content=sys_prompt))
         out.extend(history)
-        out.extend(intermediate)
+        out.extend(per_driver_intermediate[driver.name])
         return out
 
     def _build_request_for(driver: HemisphereClient, pass_index: int) -> GenerateRequest:
@@ -169,6 +222,12 @@ async def run_bicameral_loop(
         right_request = _build_request_for(right, pass_index)
 
         log.debug("bicameral pass %d: dispatching to %d drivers", pass_index, len(drivers))
+        # Snapshot the exact message lists the drivers will see — this
+        # is what feeds PassRecord.hemisphereInputs so the UI's "copy
+        # trace" diagnostic can show what each driver actually got
+        # (system prompt + history + cross-hemisphere intermediates).
+        left_input_messages = _build_messages_for(left)
+        right_input_messages = _build_messages_for(right)
         if log.isEnabledFor(logging.DEBUG):
             for driver, request in ((left, left_request), (right, right_request)):
                 for i, m in enumerate(request.messages):
@@ -224,7 +283,7 @@ async def run_bicameral_loop(
             passIndex=pass_index,
         )
 
-        score = jaccard_word_agreement(left_resp.content, right_resp.content)
+        score = scorer.score(left_resp.content, right_resp.content)
         is_last_pass = pass_index == max_passes - 1
         agreed = score >= agreement_threshold
         log.debug(
@@ -248,6 +307,10 @@ async def run_bicameral_loop(
                 PassRecord(
                     passIndex=pass_index,
                     hemispheres=[left_msg, right_msg],
+                    hemisphereInputs=[
+                        HemisphereInput(driverName=left.name, messages=left_input_messages),
+                        HemisphereInput(driverName=right.name, messages=right_input_messages),
+                    ],
                     callosum=CallosumState(
                         agreement=score,
                         decision=decision,
@@ -272,6 +335,10 @@ async def run_bicameral_loop(
             PassRecord(
                 passIndex=pass_index,
                 hemispheres=[left_msg, right_msg],
+                hemisphereInputs=[
+                    HemisphereInput(driverName=left.name, messages=left_input_messages),
+                    HemisphereInput(driverName=right.name, messages=right_input_messages),
+                ],
                 callosum=CallosumState(
                     agreement=score,
                     decision=Decision.another_pass,
@@ -279,15 +346,31 @@ async def run_bicameral_loop(
             )
         )
 
-        intermediate.append(left_msg)
-        intermediate.append(right_msg)
-        # REPROMPT is sent as `user` not `system` — many providers
-        # (MiniMax-M2.x, some xAI variants, several local OpenAI-compat
-        # servers) reject any system message after the leading one with
-        # a "invalid message role: system" 400. Semantically the
-        # reprompt is the orchestrator-as-user nudging the consciousness
-        # to reconsider, so `user` is also the more accurate role.
-        intermediate.append(Message(role=Role.user, content=REPROMPT_INSTRUCTION))
+        # Per-driver intermediate: each hemisphere sees its OWN
+        # prior response as `assistant` (role=hemisphere with their
+        # own driverName coerces to assistant downstream) and the
+        # twin's response embedded in a labeled `user` message that
+        # also carries the reprompt. After hemisphere-driver's role
+        # coercion the LLM sees:
+        #   assistant: <own response>
+        #   user: "[corpus callosum] Your twin (driver `<twin>`)
+        #          responded with: <twin response>. [REPROMPT]"
+        # which is finally a bicameral conversation it can reason
+        # over instead of two indistinguishable assistant turns.
+        per_driver_intermediate[left.name].append(left_msg)
+        per_driver_intermediate[left.name].append(
+            Message(
+                role=Role.user,
+                content=_format_twin_turn(right.name, right_resp.content),
+            )
+        )
+        per_driver_intermediate[right.name].append(right_msg)
+        per_driver_intermediate[right.name].append(
+            Message(
+                role=Role.user,
+                content=_format_twin_turn(left.name, left_resp.content),
+            )
+        )
 
     raise RuntimeError(
         "bicameral loop exited without producing a final message — should be unreachable"

@@ -159,13 +159,16 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
 
 def test_config_get_then_patch_round_trip(client: TestClient) -> None:
     initial = client.get("/v1/config").json()
-    assert initial["agreementThreshold"] == 0.5
+    # v0.2.x bumped the default 0.5 → 0.75 when the scorer switched from
+    # Jaccard word-overlap to embedding cosine similarity. The new scale
+    # makes 0.5 mean "same topic" instead of "substantively agreed."
+    assert initial["agreementThreshold"] == 0.75
     # `drivers` ships with the canonical bicameral pair on local ports.
     assert [d["name"] for d in initial["drivers"]] == ["left", "right"]
 
     patch = client.patch(
         "/v1/config",
-        json={"agreementThreshold": 0.75, "defaultMaxPasses": 5, "bogus": True},
+        json={"agreementThreshold": 0.6, "defaultMaxPasses": 5, "bogus": True},
     )
     assert patch.status_code == 200
     body = patch.json()
@@ -177,7 +180,7 @@ def test_config_get_then_patch_round_trip(client: TestClient) -> None:
     assert body["requiresRestart"] is False
 
     follow = client.get("/v1/config").json()
-    assert follow["agreementThreshold"] == 0.75
+    assert follow["agreementThreshold"] == 0.6
     assert follow["defaultMaxPasses"] == 5
 
 

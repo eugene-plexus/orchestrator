@@ -66,16 +66,15 @@ def test_chat_falls_back_to_v01_path_when_identity_unconfigured(
 
     left_sys = _system_message(left_fake.calls[0])
     right_sys = _system_message(right_fake.calls[0])
-    # Per-hemisphere preamble still applies even when identity is off.
-    assert "left hemisphere" in left_sys
-    assert "right hemisphere" in right_sys
-    # Each preamble names the OTHER driver's backend.
-    assert "'right'" in left_sys
-    assert "'left'" in right_sys
-    # Default system prompt content (Eugene Plexus persona) is shared
-    # below the preamble.
+    # v0.2.x dropped the system-prompt preamble entirely. The persona
+    # body IS the system prompt for both hemispheres. No architecture
+    # meta, no per-side labels — divergence comes from the models
+    # themselves and from per-pass cross-talk (the "you also
+    # considered" message in pass 1+), not from preamble framing.
     assert "Eugene" in left_sys
     assert "Eugene" in right_sys
+    # Both hemispheres see the same persona-only system prompt.
+    assert left_sys == right_sys
 
 
 def test_chat_with_identity_threads_constitution_into_both_hemispheres(
@@ -119,9 +118,10 @@ def test_chat_with_identity_threads_constitution_into_both_hemispheres(
 
     left_sys = _system_message(left_fake.calls[0])
     right_sys = _system_message(right_fake.calls[0])
-    assert left_sys != right_sys
-    assert "left hemisphere" in left_sys
-    assert "right hemisphere" in right_sys
+    # v0.2.x dropped the system-prompt preamble; both hemispheres see
+    # the same persona-only prompt. Per-hemisphere variation is a
+    # planned v0.3 knob.
+    assert left_sys == right_sys
 
 
 def test_chat_uses_explicit_personId_relationship_when_supplied(
@@ -320,10 +320,9 @@ def test_chat_systemPrompt_overrides_identity_persona_keeps_preamble(
     # Identity body suppressed.
     assert "honesty" not in sys_msg
     assert "Your name: Eugene." not in sys_msg
-    # Operator override present.
-    assert "TEMPORARILY ROLE: pirate" in sys_msg
-    # Preamble still there.
-    assert "left hemisphere" in sys_msg
+    # Operator override is the entire system prompt — no preamble in
+    # v0.2.x. The operator's override is what we send verbatim.
+    assert sys_msg == "TEMPORARILY ROLE: pirate"
 
 
 def test_chat_degrades_when_identity_service_is_unreachable(
@@ -378,29 +377,43 @@ def test_chat_degrades_when_identity_service_is_unreachable(
     sys_msg = _system_message(left_fake.calls[0])
     # Fallback persona came from defaultSystemPrompt (which mentions Eugene).
     assert "Eugene" in sys_msg
-    # Preamble still there.
-    assert "left hemisphere" in sys_msg
 
 
-@pytest.mark.parametrize("position_idx,expected_self,expected_twin", [(0, "left", "right"), (1, "right", "left")])
-def test_hemisphere_preamble_distinguishes_the_two_drivers(
+def test_pass0_preambles_are_identical_for_both_hemispheres(
     client: TestClient,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
-    position_idx: int,
-    expected_self: str,
-    expected_twin: str,
 ) -> None:
-    """The two drivers must receive system prompts that distinguish
-    them — otherwise the cross-vendor bicameral commitment is invisible
-    to the model and we're back to v0.1's "both think they're the only
-    speaker" failure mode."""
+    """v0.2.x dropped the per-hemisphere preamble entirely. The system
+    prompt is the persona body for both drivers — no architecture
+    meta, no per-side labels, no "you are the left hemisphere" framing.
+
+    Earlier versions added a distinguishing preamble ("you are the
+    left hemisphere, your twin is the right hemisphere running on
+    backend X") to make cross-vendor bicameral commitment visible.
+    That backfired: the LLMs started addressing the orchestrator and
+    treating each other as siblings to chat with. We now derive
+    divergence from the underlying models being different (cross-
+    vendor) and from per-pass cross-talk ("you also considered, from
+    a slightly different angle..."), which surfaces the other side's
+    content as the SAME Eugene's prior thought.
+
+    This test pins the no-preamble invariant so a future change that
+    re-introduces architectural framing gets caught with the why
+    attached. Per-hemisphere persona variation is planned for v0.3
+    (operator-selectable).
+    """
     left_fake.responses = ["hi"]
     right_fake.responses = ["hi"]
     response = client.post("/v1/chat", json={"message": "hello"})
     assert response.status_code == 200, response.text
 
-    fake = (left_fake, right_fake)[position_idx]
-    sys_msg = _system_message(fake.calls[0])
-    assert f"{expected_self} hemisphere" in sys_msg
-    assert f"{expected_twin} hemisphere" in sys_msg
+    left_sys = _system_message(left_fake.calls[0])
+    right_sys = _system_message(right_fake.calls[0])
+    assert left_sys == right_sys
+    # No per-side labels surfaced into the prompt.
+    assert "left hemisphere" not in left_sys
+    assert "right hemisphere" not in left_sys
+    # No architecture meta.
+    assert "synthetic consciousness" not in left_sys
+    assert "inner voice" not in left_sys

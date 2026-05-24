@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ from fastapi import Depends, FastAPI
 
 from . import __version__
 from .auth_state import AuthState, load_auth_state
+from .bicameral.callosum import JaccardAgreementScorer, load_default_scorer
 from .bicameral.nt import neutral_state
 from .config import ConfigStore
 from .dependencies import require_authorized, require_operator
@@ -181,6 +183,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_clients = not settings.safe_mode
     else:
         owns_clients = False
+
+    # Corpus-callosum scorer. The `disable_embedding_scorer` Settings
+    # flag short-circuits the heavy load path — tests set it via the
+    # fixture in `conftest.py` so the suite doesn't pull torch +
+    # transformers, and operators can set
+    # EUGENE_PLEXUS_ORCH_DISABLE_EMBEDDING_SCORER=1 on resource-
+    # constrained boxes. Production loads the embedding model via
+    # `to_thread` so the lifespan doesn't block uvicorn's event loop
+    # during the (multi-second) first-time model download + warmup.
+    if not hasattr(app.state, "scorer"):
+        if settings.safe_mode or settings.disable_embedding_scorer:
+            app.state.scorer = JaccardAgreementScorer()
+        else:
+            model_name = str(store.get("agreementModel") or "all-MiniLM-L6-v2")
+            app.state.scorer = await asyncio.to_thread(
+                load_default_scorer, model_name
+            )
 
     try:
         yield

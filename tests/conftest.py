@@ -77,7 +77,12 @@ class FakeHemisphereClient:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(config_file=tmp_path / "config.yaml")
+    # Keep torch + sentence-transformers out of the test environment by
+    # routing every test app through the Jaccard fallback scorer.
+    return Settings(
+        config_file=tmp_path / "config.yaml",
+        disable_embedding_scorer=True,
+    )
 
 
 @pytest.fixture
