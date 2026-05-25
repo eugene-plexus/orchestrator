@@ -101,14 +101,23 @@ FIELDS: list[ConfigField] = [
             "talks to on every chat turn. Each entry has a `name` "
             "(free-form label, e.g. \"left\" / \"right\" / \"claude\" / "
             "\"local-llama\" — appears on the UI's tabs and beside that "
-            "driver's outputs) and a `url` (HTTP base of a running "
-            "hemisphere-driver, e.g. `http://127.0.0.1:8081`). v0.1's "
-            "bicameral loop requires exactly two entries; v0.2+ will "
-            "generalize to N with backup/failover. Use the per-row "
-            "`Test` button to verify a URL is reachable before saving."
+            "driver's outputs) and a `url` picked from the watchdog "
+            "topology dropdown. v0.1's bicameral loop requires exactly "
+            "two entries; v0.2+ will generalize to N with backup/"
+            "failover. Use the per-row `Test` button to verify a URL "
+            "is reachable before saving."
         ),
         category="topology",
         valueType=ConfigValueType.driver_list,
+        # Each row's URL points at a watchdog-supervised hemisphere-
+        # driver. UI renders the URL field as a dropdown sourced from
+        # the watchdog topology rather than free-text. The longer-term
+        # design question — whether the orchestrator should maintain
+        # its own drivers list at all vs. just consuming watchdog
+        # topology — is v0.3 work (project_voicedriver_is_a_hack_v03_
+        # rethink memory). The dropdown is a near-term safety net
+        # against hand-typed URL typos.
+        componentKindHint=ComponentKind.hemisphere_driver,
         default=DEFAULT_DRIVERS,
         required=True,
         requiresRestart=True,
