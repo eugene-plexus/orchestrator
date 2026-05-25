@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI
 
 from . import __version__
@@ -59,9 +60,49 @@ def build_clients(store: ConfigStore, auth_state: AuthState) -> list[HemisphereC
     return clients
 
 
-def build_memory(store: ConfigStore, auth_state: AuthState) -> tuple[MemoryClient, str]:
-    """Construct the memory client from config. Returns (client, url)."""
-    memory_url = str(store.get("memoryUrl") or "http://127.0.0.1:8083")
+async def resolve_peer_url(
+    *,
+    kind: str,
+    watchdog_url: str,
+    service_token: str | None,
+    timeout_seconds: float = 5.0,
+) -> str | None:
+    """Ask the watchdog where a peer component lives.
+
+    The watchdog is the source of truth for body-component topology;
+    duplicating URLs in every component's config is the OpenClaw-style
+    trap we're avoiding. When an operator-supplied URL is missing for
+    a peer (`memoryUrl`, `identityUrl`), the orchestrator calls this
+    to get it directly from `GET /v1/components` filtered by `kind`.
+
+    Returns the peer's URL (with any trailing slash stripped) or None
+    when the watchdog can't be reached / has no entry of that kind.
+    """
+    headers = {"Authorization": f"Bearer {service_token}"} if service_token else {}
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.get(
+                f"{watchdog_url.rstrip('/')}/v1/components",
+                headers=headers,
+            )
+        if response.status_code >= 400:
+            return None
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    components = body.get("components") if isinstance(body, dict) else None
+    if not isinstance(components, list):
+        return None
+    for c in components:
+        if isinstance(c, dict) and c.get("kind") == kind:
+            url = c.get("url")
+            if isinstance(url, str) and url:
+                return url.rstrip("/")
+    return None
+
+
+def build_memory(memory_url: str, auth_state: AuthState) -> tuple[MemoryClient, str]:
+    """Construct the memory client from a resolved URL. Returns (client, url)."""
     # Memory ops are short — append a message, fetch a conversation. The
     # 30s ceiling here is far more generous than needed but matches the
     # connection-timeout shape used elsewhere; bump only if a future
@@ -78,15 +119,9 @@ def build_memory(store: ConfigStore, auth_state: AuthState) -> tuple[MemoryClien
 
 
 def build_identity(
-    store: ConfigStore, auth_state: AuthState
-) -> tuple[IdentityClient, str] | None:
-    """Construct the identity client from config. Returns None when
-    `identityUrl` isn't configured — the chat handler falls back to the
-    v0.1 single-shared-system-prompt path in that case."""
-    raw = store.get("identityUrl")
-    if not raw:
-        return None
-    identity_url = str(raw)
+    identity_url: str, auth_state: AuthState
+) -> tuple[IdentityClient, str]:
+    """Construct the identity client from a resolved URL. Returns (client, url)."""
     return (
         HttpIdentity(
             base_url=identity_url,
@@ -135,6 +170,32 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     auth_state: AuthState = app.state.auth_state
 
+    # Resolve peer URLs. Operator-supplied config wins; otherwise we ask
+    # the watchdog (source of truth for body-component topology) and
+    # auto-resolve. The duplicate-URL trap — where an operator who set
+    # up identity in the wizard nevertheless has identityUrl unset on
+    # the orchestrator and silently runs without identity — is exactly
+    # what this auto-resolve closes.
+    async def _resolve(kind: str, config_key: str) -> str | None:
+        explicit = str(store.get(config_key) or "").strip()
+        if explicit:
+            return explicit
+        if settings.safe_mode:
+            return None
+        resolved = await resolve_peer_url(
+            kind=kind,
+            watchdog_url=settings.watchdog_url,
+            service_token=auth_state.service_token,
+        )
+        if resolved:
+            log.info(
+                "auto-resolved %s from watchdog: %s (config field %s was unset)",
+                kind,
+                resolved,
+                config_key,
+            )
+        return resolved
+
     # Same injection trick as hemisphere clients: tests pre-populate
     # `app.state.memory` with an `InProcessMemory` so the lifespan
     # doesn't try to reach a real memory service. In production the
@@ -145,7 +206,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.memory_url = ""
             owns_memory = False
         else:
-            memory, memory_url = build_memory(store, auth_state)
+            memory_url = await _resolve("memory", "memoryUrl") or "http://127.0.0.1:8083"
+            memory, memory_url = build_memory(memory_url, auth_state)
             app.state.memory = memory
             app.state.memory_url = memory_url
             owns_memory = True
@@ -153,25 +215,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_memory = False
         app.state.memory_url = getattr(app.state, "memory_url", "")
 
-    # Identity is optional: when unconfigured the chat handler falls back
-    # to the v0.1 prompt-building path. Mirrors the memory-injection
-    # pattern so tests can pre-populate `app.state.identity`.
+    # Identity is optional: when unconfigured AND the watchdog has no
+    # identity entry, the chat handler falls back to the v0.1
+    # prompt-building path. Mirrors the memory-injection pattern so
+    # tests can pre-populate `app.state.identity`.
     if not hasattr(app.state, "identity"):
         if settings.safe_mode:
             app.state.identity = None
             app.state.identity_url = ""
             owns_identity = False
         else:
-            built = build_identity(store, auth_state)
-            if built is None:
-                app.state.identity = None
-                app.state.identity_url = ""
-                owns_identity = False
-            else:
-                identity, identity_url = built
+            identity_url = await _resolve("identity", "identityUrl")
+            if identity_url:
+                identity, identity_url = build_identity(identity_url, auth_state)
                 app.state.identity = identity
                 app.state.identity_url = identity_url
                 owns_identity = True
+            else:
+                app.state.identity = None
+                app.state.identity_url = ""
+                owns_identity = False
     else:
         owns_identity = False
         app.state.identity_url = getattr(app.state, "identity_url", "")
