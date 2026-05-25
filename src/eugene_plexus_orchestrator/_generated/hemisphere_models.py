@@ -120,6 +120,26 @@ class BackendKind(StrEnum):
     openai_compat_http = 'openai_compat_http'
 
 
+class ComponentKind(StrEnum):
+    """
+    Which Eugene Plexus component class a topology entry represents.
+    Lives in `common.yaml` because multiple components reference it:
+    the watchdog's `/v1/components`, and (via `ConfigField.
+    componentKindHint`) any component declaring a config field that
+    points at a peer of a specific kind. v0.1 covered three body
+    parts (orchestrator, hemisphere-driver, memory); v0.2 adds
+    `identity` (Default Mode Network analogue) and `connector`
+    (external sense organs).
+
+    """
+
+    orchestrator = 'orchestrator'
+    hemisphere_driver = 'hemisphere-driver'
+    memory = 'memory'
+    identity = 'identity'
+    connector = 'connector'
+
+
 class Problem(BaseModel):
     """
     Error response shape, modeled on RFC 7807 (problem+json). Every
@@ -871,6 +891,10 @@ class ConfigField(BaseModel):
     suggestions: list[str] | None = Field(
         None,
         description="Discovery-time hints — values the operator might want\nbut which AREN'T enforced by validation. UIs render\nstring-typed fields with non-empty `suggestions` as a\ncombobox (free-text input with a dropdown of suggestions)\nrather than a strict dropdown. Use when the set of\nvalid values is large, partially-discoverable, or\nextends beyond what the component knows at the moment\n(e.g. local LLM model lists that update when the operator\npulls a new model). Distinct from `enumValues`:\nsuggestions are advisory, enumValues are mandatory.\n",
+    )
+    componentKindHint: ComponentKind | None = Field(
+        None,
+        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the watchdog's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(hemisphere-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
     )
     enumLabels: list[str] | None = Field(
         None,

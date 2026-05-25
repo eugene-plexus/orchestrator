@@ -4,7 +4,7 @@ Regenerate with:
 
     python scripts/codegen.py
 
-Source: https://github.com/eugene-plexus/specs at commit 764d4a1dad7693c7d61b4799fbec9cc0869bc1e8
+Source: https://github.com/eugene-plexus/specs at commit a812379f32633037a926de5fb7ec87dd8f89ce79
 """
 
-SPECS_REF = "764d4a1dad7693c7d61b4799fbec9cc0869bc1e8"
+SPECS_REF = "a812379f32633037a926de5fb7ec87dd8f89ce79"

@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from ._generated.models import (
+    ComponentKind,
     ConfigDocument,
     ConfigField,
     ConfigFieldError,
@@ -114,32 +115,35 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="memoryUrl",
-        label="Memory service URL",
+        label="Memory service",
         description=(
-            "HTTP base of the running `eugene-plexus/memory` service — "
-            "where conversation history is stored and retrieved. v0.1 "
-            "ships an in-process memory backend on port 8083 by default."
+            "Which `eugene-plexus/memory` instance stores and retrieves "
+            "conversation history. The UI populates this from the "
+            "watchdog topology; stock installs have exactly one memory "
+            "backend, so the dropdown becomes effectively a toggle."
         ),
         category="memory",
         valueType=ConfigValueType.url,
+        componentKindHint=ComponentKind.memory,
         default="http://127.0.0.1:8083",
         required=True,
         requiresRestart=True,
     ),
     ConfigField(
         key="identityUrl",
-        label="Identity service URL",
+        label="Identity service",
         description=(
-            "HTTP base of the running `eugene-plexus/identity` service — "
-            "Eugene's constitution + self-model + person registry. When "
-            "set, the orchestrator pulls constitution + relevant "
-            "self-model entries + the speaker's relationship summary on "
-            "every chat turn and assembles per-hemisphere system prompts "
-            "from them. Leave unset to fall back to v0.1's single "
-            "shared-system-prompt path (uses `defaultSystemPrompt`)."
+            "Which `eugene-plexus/identity` instance owns Eugene's "
+            "constitution + self-model + person registry. When set, the "
+            "orchestrator pulls constitution + relevant self-model "
+            "entries + the speaker's relationship summary on every chat "
+            "turn and assembles per-hemisphere system prompts from "
+            "them. Pick `(off)` to fall back to v0.1's single shared-"
+            "system-prompt path (uses `defaultSystemPrompt`)."
         ),
         category="identity",
         valueType=ConfigValueType.url,
+        componentKindHint=ComponentKind.identity,
         default=None,
         required=False,
         requiresRestart=True,
