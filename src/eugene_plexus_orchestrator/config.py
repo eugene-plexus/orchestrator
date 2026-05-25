@@ -184,13 +184,22 @@ FIELDS: list[ConfigField] = [
             "How many recent memory entries with the speaker to inject "
             "into each chat turn's per-hemisphere prompts. 0 disables. "
             "v0.2 pulls these raw from memory (skip-extraction); v0.3 "
-            "adds reactive synthesis via the topic-shift detector. "
+            "adds reactive synthesis via the topic-shift detector + "
+            "semantic search so relevant older memory surfaces too. "
             "Higher values give Eugene more concrete relationship "
             "context at the cost of token budget."
         ),
         category="memory",
+        # Bumped 10 → 30 (2026-05-25 smoke-test finding): default 10 was
+        # ~5 chat turns, which fell out of any conversation that lasted
+        # more than a few back-and-forths. Empirically Eugene was
+        # confabulating handle backstories that were explained earlier
+        # in the same session — the relevant memory existed but was
+        # outside the recency window. 30 entries ≈ 15 turns covers
+        # most "today's chat so far" patterns. Still recency-bound;
+        # real fix is semantic memory search in v0.3.
         valueType=ConfigValueType.integer,
-        default=10,
+        default=30,
         minimum=0,
         maximum=200,
     ),
