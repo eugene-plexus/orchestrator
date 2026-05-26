@@ -903,6 +903,14 @@ class ChatRequest(BaseModel):
     requestId: UUID | None = Field(
         None, description='Caller-supplied id for log correlation.'
     )
+    incognito: bool | None = Field(
+        False,
+        description="(v0.2.1) Run this turn in incognito mode. When true:\n- Eugene's full identity loads (constitution + self-model)\n  — Eugene remains himself.\n- The speaker is treated as a stranger: no person lookup,\n  no relationship summary, no recent-turns retrieval from\n  memory.\n- Neither the user message nor Eugene's reply is persisted\n  to memory.\n- The running NT state is read for modulation but NOT\n  updated by this turn.\n- The conversation history for the turn comes from\n  `history` (below) instead of memory. Callers (typically\n  the UI) hold the incognito session's history client-side.\nUse for testing the inner-thought-process without identity\nand memory feedback loops, or for transient conversations\nan operator wants Eugene to forget.\n",
+    )
+    history: list[Message] | None = Field(
+        None,
+        description='(v0.2.1) Conversation history for this turn, supplied by\nthe caller. Honored only when `incognito` is true — in\nthat mode the orchestrator does not read memory, so the\ncaller must carry history forward. Ignored when\n`incognito` is false (the orchestrator loads history from\nmemory by `conversationId` as in v0.2).\n',
+    )
 
 
 class NTState(BaseModel):

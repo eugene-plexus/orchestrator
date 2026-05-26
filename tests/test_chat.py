@@ -184,6 +184,83 @@ def test_chat_502_falls_back_to_raw_body_when_driver_returns_non_problem(
     assert "upstream-status=500" in detail["detail"]
 
 
+def test_chat_incognito_does_not_persist_to_memory(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """Incognito turns must leave no trace in memory.
+
+    Regression guard for v0.2.1 incognito mode: validates that an
+    incognito chat round-trip succeeds, returns a voice-pass reply, AND
+    that the conversationId returned is NOT resolvable as a real
+    memory conversation (a normal chat creates a memory-backed
+    conversation; incognito does not)."""
+    # Run an incognito turn. Voice pass is the only LLM call —
+    # deliberation loop runs both hemispheres + voice on left.
+    left_fake.responses = ["agree", "voice reply"]
+    right_fake.responses = ["agree"]
+
+    response = client.post(
+        "/v1/chat",
+        json={"message": "hello, stranger", "incognito": True},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["message"]["content"] == "voice reply"
+
+    # The conversationId in the response must NOT exist in memory.
+    # Non-incognito chat would have created it; incognito skips
+    # memory.create() and synthesizes an ephemeral UUID instead.
+    convo_id = body["conversationId"]
+    fetched = client.get(f"/v1/conversations/{convo_id}")
+    assert fetched.status_code == 404, (
+        "incognito turn leaked into memory — found conversation "
+        f"{convo_id} after a turn that should have left no trace"
+    )
+
+
+def test_chat_incognito_honors_request_history(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """When incognito is true, conversation history comes from the
+    request body, not memory. The history field is the bridge that
+    lets a multi-turn incognito conversation work without persistence."""
+    left_fake.responses = ["follow-up agree", "voice follow-up"]
+    right_fake.responses = ["follow-up agree"]
+
+    # Second turn of an incognito conversation: the caller supplies the
+    # prior turn pair via `history`.
+    response = client.post(
+        "/v1/chat",
+        json={
+            "message": "what did I just say?",
+            "incognito": True,
+            "history": [
+                {"role": "user", "content": "I like Tom Hanks movies."},
+                {"role": "assistant", "content": "Castaway is the right answer."},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["message"]["content"] == "voice follow-up"
+
+    # Verify the hemispheres saw the supplied history. Both hemispheres
+    # received the same history; check the left one.
+    left_calls = left_fake.calls
+    assert left_calls, "left hemisphere never called"
+    # First pass should include the user-supplied history before the
+    # current message.
+    first_call_messages = left_calls[0].messages
+    # Filter to user-role messages (excluding the leading system prompt).
+    user_contents = [m.content for m in first_call_messages if m.role.value == "user"]
+    assert "I like Tom Hanks movies." in user_contents
+    assert "what did I just say?" in user_contents
+
+
 def test_chat_sets_temperature_and_max_tokens_from_config_on_every_pass(
     client: TestClient,
     left_fake: FakeHemisphereClient,

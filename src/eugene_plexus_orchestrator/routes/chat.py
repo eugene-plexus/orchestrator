@@ -228,6 +228,7 @@ async def _build_per_driver_system_prompts(
     operator_override: str | None,
     fallback_default: str,
     recent_turns: list[MemoryEntry] | None = None,
+    incognito: bool = False,
 ) -> dict[str, str]:
     """Assemble per-hemisphere system prompts.
 
@@ -256,17 +257,17 @@ async def _build_per_driver_system_prompts(
     elif identity is not None:
         # Resolve the speaker's personId: explicit body.personId wins;
         # otherwise default to the operator (UI chat calls without a
-        # personId are by-design operator turns).
-        effective_person_id = person_id or operator_person_id
+        # personId are by-design operator turns). Incognito turns
+        # short-circuit person resolution entirely — speaker is a
+        # stranger by construction.
+        effective_person_id = None if incognito else (person_id or operator_person_id)
         constitution = await identity.get_constitution()
-        # v0.2 has no topic-detection yet; pass the raw user message as
-        # the topic hint. The identity component does a starts-with /
-        # exact-match against `topic` and falls back to recency, so the
-        # full-message-as-topic produces near-recency behavior here —
-        # good enough until v0.3 adds the topic-shift detector.
+        # Incognito turns pull self-model entries with no person filter
+        # (Eugene's general self-observations apply) but never load
+        # person-scoped entries that bias toward a particular speaker.
         self_model_task = identity.query_self_model(
             topic=None,
-            person_id=effective_person_id,
+            person_id=None if incognito else effective_person_id,
             limit=5,
         )
         if effective_person_id is not None:
@@ -286,7 +287,23 @@ async def _build_per_driver_system_prompts(
         sm_text = _render_self_model(self_model_entries)
         if sm_text:
             sections.append(sm_text)
-        if relationship is not None:
+        if incognito:
+            # The user explicitly asked to be a stranger. Eugene's full
+            # self loads above; the social context here is "you do not
+            # know this person, you have no prior history with them."
+            # Phrased to suppress the helpful-assistant default that
+            # would otherwise kick in for unknown speakers — Eugene
+            # should react like meeting someone new, not like opening a
+            # support ticket.
+            sections.append(
+                "You are talking to a stranger. You do not recognize them, "
+                "you have no shared history with them, and you have no "
+                "operator-supplied context about who they are. React as "
+                "you would to someone new — curious, guarded, terse, "
+                "playful, dismissive, or whatever fits the message they "
+                "actually sent. You owe them nothing by default."
+            )
+        elif relationship is not None:
             rel_text = _render_relationship(relationship, person_record)
             if rel_text:
                 sections.append(rel_text)
@@ -365,8 +382,11 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     # MemoryEntry with the right personId. body.personId wins; otherwise
     # fall back to the operator's personId from identity. UI chat calls
     # have no personId by design — they're always operator turns.
+    # Incognito turns bypass person resolution entirely — the speaker
+    # is a stranger by construction.
+    incognito = bool(getattr(body, "incognito", False))
     operator_person_id: UUID | None = None
-    if identity is not None and body.personId is None:
+    if not incognito and identity is not None and body.personId is None:
         try:
             operator_person_id = await _resolve_operator_person_id(identity)
         except httpx.HTTPError as e:
@@ -378,82 +398,99 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             # Don't fail the chat turn just because identity is down —
             # degrade to no-person-context and continue.
             operator_person_id = None
-    effective_person_id = body.personId or operator_person_id or NIL_PERSON_ID
+    effective_person_id = (
+        NIL_PERSON_ID
+        if incognito
+        else (body.personId or operator_person_id or NIL_PERSON_ID)
+    )
 
     # NT state evolves across turns; the chat handler reads the current
     # state, decays it by elapsed time (handled inside `tick`), and
     # writes back the post-turn state at the end. v0.3+ will surface
     # this in the response so the UI can show the cognitive arc of a
     # conversation; v0.2 just modulates the bicameral loop with it.
+    # Incognito turns READ the running NT state (Eugene's current mood
+    # informs the turn) but never WRITE it back — incognito leaves no
+    # trace, including on Eugene's internal state.
     nt_at_start: NTState = request.app.state.nt_state
 
-    try:
-        if body.conversationId is not None:
-            existing = await memory.get(body.conversationId)
-            if existing is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=Problem(
-                        type="https://github.com/eugene-plexus/orchestrator#conversation-not-found",
-                        title="Conversation not found",
-                        status=404,
-                        detail=f"No conversation with id {body.conversationId}.",
-                        component="orchestrator",
-                    ).model_dump(exclude_none=True),
-                )
-            conversation_id = body.conversationId
-            history = list(existing.messages)
-        else:
-            conversation_id = await memory.create()
-            history = []
-
-        user_message = Message(role=Role.user, content=body.message)
-        await memory.append_entry(
-            conversation_id,
-            _build_memory_entry(
-                conversation_id=conversation_id,
-                person_id=effective_person_id,
-                message=user_message,
-                nt_snapshot=nt_at_start,
-            ),
-        )
-    except httpx.HTTPError as e:
-        log.warning("memory service unreachable: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#memory-error",
-                title="Memory service error",
-                status=502,
-                detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
-                component="orchestrator",
-            ).model_dump(exclude_none=True),
-        ) from e
-
-    # Pull recent turns with this person from memory — feeds the
-    # relationship-context section of the per-hemisphere prompts. Skip
-    # for NIL_PERSON_ID (we'd just get unrelated NIL-bucket entries).
-    # Failure here degrades silently: prompts still get built without
-    # the recent-turns section.
-    recent_with_person: list[MemoryEntry] = []
-    if effective_person_id != NIL_PERSON_ID:
+    if incognito:
+        # Incognito path: no memory I/O at all. Conversation history
+        # comes from the request body (UI holds it client-side for the
+        # duration of the incognito session). Conversation id is
+        # passthrough only — used so the UI can correlate turns,
+        # never resolved against memory.
+        conversation_id = body.conversationId or uuid4()
+        history = list(body.history or [])
+        recent_with_person: list[MemoryEntry] = []
+    else:
         try:
-            recent_with_person = await memory.person_recent(
-                effective_person_id,
-                limit=int(store.get("personRecentLimit") or 10),
-                # Exclude the active conversation — its turns are already
-                # in `history` and don't need to be replayed as ambient
-                # context.
+            if body.conversationId is not None:
+                existing = await memory.get(body.conversationId)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=Problem(
+                            type="https://github.com/eugene-plexus/orchestrator#conversation-not-found",
+                            title="Conversation not found",
+                            status=404,
+                            detail=f"No conversation with id {body.conversationId}.",
+                            component="orchestrator",
+                        ).model_dump(exclude_none=True),
+                    )
+                conversation_id = body.conversationId
+                history = list(existing.messages)
+            else:
+                conversation_id = await memory.create()
+                history = []
+
+            user_message = Message(role=Role.user, content=body.message)
+            await memory.append_entry(
+                conversation_id,
+                _build_memory_entry(
+                    conversation_id=conversation_id,
+                    person_id=effective_person_id,
+                    message=user_message,
+                    nt_snapshot=nt_at_start,
+                ),
             )
-            recent_with_person = [
-                e for e in recent_with_person if e.conversationId != conversation_id
-            ]
         except httpx.HTTPError as e:
-            log.warning(
-                "memory service unreachable while fetching person_recent: %s "
-                "(continuing without recent-turns context)",
-                e,
-            )
+            log.warning("memory service unreachable: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=Problem(
+                    type="https://github.com/eugene-plexus/orchestrator#memory-error",
+                    title="Memory service error",
+                    status=502,
+                    detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
+                    component="orchestrator",
+                ).model_dump(exclude_none=True),
+            ) from e
+
+        # Pull recent turns with this person from memory — feeds the
+        # relationship-context section of the per-hemisphere prompts.
+        # Skip for NIL_PERSON_ID (we'd just get unrelated NIL-bucket
+        # entries). Failure here degrades silently: prompts still get
+        # built without the recent-turns section.
+        recent_with_person = []
+        if effective_person_id != NIL_PERSON_ID:
+            try:
+                recent_with_person = await memory.person_recent(
+                    effective_person_id,
+                    limit=int(store.get("personRecentLimit") or 10),
+                    # Exclude the active conversation — its turns are
+                    # already in `history` and don't need to be replayed
+                    # as ambient context.
+                )
+                recent_with_person = [
+                    e for e in recent_with_person if e.conversationId != conversation_id
+                ]
+            except httpx.HTTPError as e:
+                log.warning(
+                    "memory service unreachable while fetching person_recent: %s "
+                    "(continuing without recent-turns context)",
+                    e,
+                )
 
     try:
         system_prompts = await _build_per_driver_system_prompts(
@@ -465,6 +502,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             operator_override=body.systemPrompt,
             fallback_default=str(store.get("defaultSystemPrompt") or ""),
             recent_turns=recent_with_person,
+            incognito=incognito,
         )
     except httpx.HTTPError as e:
         log.warning(
@@ -621,41 +659,46 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             ).model_dump(exclude_none=True),
         ) from e
 
-    # Evolve NT state from the turn's deliberation observations and
-    # store it back — next turn will read the post-turn state. The new
-    # state is also what gets stamped on Eugene's reply MemoryEntry.
+    # Evolve NT state from the turn's deliberation observations.
+    # Incognito turns READ the running NT state for modulation but
+    # never WRITE it back — incognito leaves no trace, including on
+    # Eugene's internal state. Compute `nt_at_end` either way so the
+    # response carries the would-have-been state (useful for diagnostic
+    # traces) and downstream callers see a consistent shape.
     observations = _build_observations(outcome, agreement_threshold)
     nt_at_end = tick(nt_at_start, observations=observations)
-    request.app.state.nt_state = nt_at_end
+    if not incognito:
+        request.app.state.nt_state = nt_at_end
 
     # The voice pass output IS the user-facing reply. Deliberation
     # outputs remain in `outcome.passes` for diagnostic transparency
     # but are never the message Eugene sends back.
     final_message = voice_outcome.output
 
-    try:
-        await memory.append_entry(
-            conversation_id,
-            _build_memory_entry(
-                conversation_id=conversation_id,
-                person_id=effective_person_id,
-                message=final_message,
-                nt_snapshot=nt_at_end,
-                hemisphere_attribution="voice",
-            ),
-        )
-    except httpx.HTTPError as e:
-        log.warning("memory service unreachable while persisting reply: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#memory-error",
-                title="Memory service error",
-                status=502,
-                detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
-                component="orchestrator",
-            ).model_dump(exclude_none=True),
-        ) from e
+    if not incognito:
+        try:
+            await memory.append_entry(
+                conversation_id,
+                _build_memory_entry(
+                    conversation_id=conversation_id,
+                    person_id=effective_person_id,
+                    message=final_message,
+                    nt_snapshot=nt_at_end,
+                    hemisphere_attribution="voice",
+                ),
+            )
+        except httpx.HTTPError as e:
+            log.warning("memory service unreachable while persisting reply: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=Problem(
+                    type="https://github.com/eugene-plexus/orchestrator#memory-error",
+                    title="Memory service error",
+                    status=502,
+                    detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
+                    component="orchestrator",
+                ).model_dump(exclude_none=True),
+            ) from e
 
     return ChatResponse(
         conversationId=conversation_id,
