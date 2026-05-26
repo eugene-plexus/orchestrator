@@ -68,6 +68,8 @@ VOICE_PASS_SCRATCHPAD_SUFFIX = (
     "based on the notes. Do not quote, recite, paraphrase, or address "
     "the notes themselves.\n\n"
     "---\n\n"
+    "{agreement_directive}\n\n"
+    "---\n\n"
     "Banned outputs — every one of these is a failure mode. The "
     "model that produced this skill has strong defaults toward "
     "several of them; override every default:\n\n"
@@ -142,6 +144,56 @@ class VoicePassOutcome:
     latency_ms: int
 
 
+def _agreement_directive(final_agreement: float) -> str:
+    """Map the deliberation's final-pass agreement score to a register
+    directive for the voice pass.
+
+    This is the architectural payoff of the bicameral loop: the
+    agreement score is a measure of how aligned Eugene's two trains
+    of thought were on this turn, and the voice pass surfaces that
+    internal state as register / tone in the user-facing reply. Eugene
+    who agreed with himself sounds confident; Eugene who didn't sounds
+    of-two-minds. A single-driver agent has no analogous axis.
+
+    Three bands — high (≥0.75), mid (0.4–0.75), low (<0.4). Bands are
+    absolute, not relative to the configured agreement threshold,
+    because the threshold is a *termination* decision (\"stop
+    deliberating\") and the bands are a *register* decision (\"how
+    certain do I sound\"). Conflating them would couple two separate
+    knobs in confusing ways.
+    """
+    if final_agreement >= 0.75:
+        return (
+            "Internal-state directive: your two trains of thought "
+            "converged on this. This is what internal certainty feels "
+            "like. Speak with conviction. Cut hedges — \"I think\", "
+            "\"maybe\", \"perhaps\", \"could be\" are off-limits unless "
+            "your reaction itself is genuinely uncertain about something "
+            "the deliberation didn't settle. Confidence in the reply "
+            "should match the confidence in the deliberation."
+        )
+    if final_agreement >= 0.4:
+        return (
+            "Internal-state directive: your two trains of thought "
+            "mostly agree but with real friction. This is what genuine-"
+            "but-imperfect certainty feels like. Some hedging is "
+            "appropriate; do not oversell what you actually know. If "
+            "you have a real take, commit to it — but allow that you "
+            "might be wrong about the edges."
+        )
+    return (
+        "Internal-state directive: your two trains of thought did NOT "
+        "agree on this. You are genuinely of two minds. Let it show in "
+        "the reply — be tentative, conflicted, terse, ambivalent, "
+        "skeptical, or evasive. Honest uncertainty is more authentic "
+        "than synthesized confidence. You do not owe the user a "
+        "definitive answer when you don't have one. A short, "
+        "noncommittal reaction is the correct shape here — not a long "
+        "balanced essay covering both perspectives. Real people under "
+        "internal conflict get terse, not expansive."
+    )
+
+
 def _format_deliberation_summary(deliberation_finals: list[Message]) -> str:
     """Render the deliberation's last-pass outputs as a labeled
     bullet list for the voice pass's prompt.
@@ -167,6 +219,7 @@ async def run_voice_pass(
     history: list[Message],
     system_prompt: str,
     deliberation_finals: list[Message],
+    final_agreement: float,
     nt_state: NTState,
     temperature: float | None,
     max_tokens: int | None,
@@ -179,17 +232,24 @@ async def run_voice_pass(
     just-completed deliberation and instructs the model to address the
     actual user.
 
+    `final_agreement` is the agreement score from the last deliberation
+    pass — used to shape the register directive injected into the
+    scratchpad. This is how the bicameral loop's "did Eugene's two
+    minds agree?" signal becomes audible in his actual reply.
+
     `history` is the conversation history WITHOUT the current
     `user_message` — the current message is appended after history,
     then the voice directive is bracketed in a final user message.
     """
     summary = _format_deliberation_summary(deliberation_finals)
+    directive = _agreement_directive(final_agreement)
     # Scratchpad lives in the system message as the model's private
     # notes. Without this restructure the model treats the trailing
     # directive as another user turn to respond to and explainers
     # the deliberation summary back at the user verbatim.
     scratchpad_suffix = VOICE_PASS_SCRATCHPAD_SUFFIX.format(
-        deliberation_summary=summary
+        deliberation_summary=summary,
+        agreement_directive=directive,
     )
     voice_system_prompt = (system_prompt or "") + scratchpad_suffix
 
@@ -237,4 +297,4 @@ async def run_voice_pass(
     )
 
 
-__all__ = ["VoicePassOutcome", "run_voice_pass"]
+__all__ = ["VoicePassOutcome", "run_voice_pass", "_agreement_directive"]

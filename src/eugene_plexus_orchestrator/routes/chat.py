@@ -611,6 +611,15 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     deliberation_finals = (
         outcome.passes[-1].hemispheres if outcome.passes else []
     )
+    # The agreement score from the final pass becomes Eugene's
+    # internal-certainty signal in the voice pass. High agreement →
+    # confident register; low agreement → tentative / of-two-minds
+    # register. This is the architectural payoff of the bicameral
+    # loop: the "did my two minds agree?" measurement actually shapes
+    # how Eugene sounds. A single-driver agent has no analogous axis.
+    final_agreement = (
+        outcome.passes[-1].callosum.agreement if outcome.passes else 0.5
+    )
     voice_persona = system_prompts.get(voice_driver.name) or next(
         iter(system_prompts.values()), ""
     )
@@ -621,6 +630,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             history=history,
             system_prompt=voice_persona,
             deliberation_finals=list(deliberation_finals),
+            final_agreement=final_agreement,
             nt_state=nt_at_start,
             temperature=voice_temperature,
             max_tokens=max_tokens,

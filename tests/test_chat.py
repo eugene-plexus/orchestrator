@@ -184,6 +184,88 @@ def test_chat_502_falls_back_to_raw_body_when_driver_returns_non_problem(
     assert "upstream-status=500" in detail["detail"]
 
 
+def test_agreement_directive_bands_distinct() -> None:
+    """The agreement-to-register helper must return materially different
+    directives across its three bands.
+
+    Regression guard for the architectural-payoff change: the voice
+    pass's whole point of seeing the agreement score is that high vs.
+    low agreement produces a different register in the user-facing
+    reply. If all three bands collapsed to the same text, the
+    bicameral signal would be silent at the user-facing surface
+    again."""
+    from eugene_plexus_orchestrator.bicameral.voice import _agreement_directive
+
+    high = _agreement_directive(0.9)
+    mid = _agreement_directive(0.55)
+    low = _agreement_directive(0.2)
+
+    # All three are non-empty.
+    assert high.strip() and mid.strip() and low.strip()
+    # All three are distinct.
+    assert high != mid
+    assert mid != low
+    assert high != low
+    # Band-typical vocabulary appears in the right places.
+    assert "conviction" in high.lower() or "certainty" in high.lower()
+    assert "friction" in mid.lower() or "imperfect" in mid.lower()
+    assert "two minds" in low.lower() or "ambivalent" in low.lower()
+
+
+def test_chat_voice_pass_scratchpad_carries_low_agreement_directive(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """End-to-end: when deliberation ends with low agreement, the voice
+    pass system prompt must include the low-band directive language.
+
+    This is what makes the bicameral architecture's `agreement` score
+    visible at the user-facing surface. Without this wire-up, the
+    score is internal trivia."""
+    # Force disagreement: hemispheres produce non-overlapping content
+    # on every pass. Voice pass receives the divergent finals + a
+    # low-band register directive.
+    left_fake.responses = ["alpha alpha alpha", "beta beta beta", "voice"]
+    right_fake.responses = ["xenon xenon xenon", "yttrium yttrium yttrium"]
+
+    response = client.post("/v1/chat", json={"message": "hi", "maxPasses": 2})
+    assert response.status_code == 200, response.text
+
+    # The voice pass is the LEFT fake's last call. Its system prompt
+    # should contain the low-agreement directive phrasing.
+    voice_call = left_fake.calls[-1]
+    system_msgs = [m for m in voice_call.messages if m.role.value == "system"]
+    assert system_msgs, "voice pass had no system message"
+    system_text = system_msgs[0].content
+    # Low-band signal words.
+    assert "two minds" in system_text.lower() or "did NOT agree" in system_text
+
+
+def test_chat_voice_pass_scratchpad_carries_high_agreement_directive(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """End-to-end converse: when hemispheres agree, the voice pass
+    scratchpad must include the high-band directive — confident
+    register, no hedging."""
+    # Identical responses → agreement 1.0 → terminate at pass 0.
+    # +1 entry on left for the voice pass that follows.
+    left_fake.responses = ["consensus reached", "voice"]
+    right_fake.responses = ["consensus reached"]
+
+    response = client.post("/v1/chat", json={"message": "hi"})
+    assert response.status_code == 200, response.text
+
+    voice_call = left_fake.calls[-1]
+    system_msgs = [m for m in voice_call.messages if m.role.value == "system"]
+    assert system_msgs
+    system_text = system_msgs[0].content
+    # High-band signal words.
+    assert "conviction" in system_text.lower() or "certainty" in system_text.lower()
+
+
 def test_chat_incognito_does_not_persist_to_memory(
     client: TestClient,
     left_fake: FakeHemisphereClient,
