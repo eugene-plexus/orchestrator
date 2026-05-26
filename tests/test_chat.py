@@ -184,6 +184,104 @@ def test_chat_502_falls_back_to_raw_body_when_driver_returns_non_problem(
     assert "upstream-status=500" in detail["detail"]
 
 
+def test_cross_pass_default_uses_parallel_thread_framing(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """Default crossPassFraming is `parallel_thread`. On pass 1+ each
+    hemisphere must see the twin's pass-0 output wrapped in
+    <parallel_thread> tags, NOT as a 'You also considered...' prefix.
+
+    Without this wire-up, the v0.2.1 framing rewrite is silently
+    inactive — the loop still ships the v0.2.0 prefix shape."""
+    # Force a second pass so cross-pass framing actually fires.
+    left_fake.responses = ["alpha alpha", "beta beta", "voice"]
+    right_fake.responses = ["xenon xenon", "yttrium yttrium"]
+
+    response = client.post("/v1/chat", json={"message": "hi", "maxPasses": 2})
+    assert response.status_code == 200, response.text
+
+    # Pass 1 left should have seen right's pass-0 output wrapped in tags.
+    # left_fake.calls[0] = pass 0; left_fake.calls[1] = pass 1; [2] = voice.
+    pass1_messages = left_fake.calls[1].messages
+    twin_carrier = next(
+        (m for m in pass1_messages if m.role.value == "user" and "<parallel_thread>" in m.content),
+        None,
+    )
+    assert twin_carrier is not None, (
+        "default framing should wrap the twin's output in <parallel_thread> "
+        "tags inside a user-role message"
+    )
+    assert "xenon xenon" in twin_carrier.content
+    # The legacy prefix language must NOT appear under the default framing.
+    assert "You also considered" not in twin_carrier.content
+
+
+def test_cross_pass_default_appends_substrate_note_to_system_prompt(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """When parallel_thread framing is in use, each hemisphere's system
+    prompt must define the <parallel_thread> tag via
+    BICAMERAL_SUBSTRATE_NOTE — otherwise the model has to guess what
+    the tag means and the entire reframing falls back to the
+    interpretive ambiguity we were trying to fix."""
+    left_fake.responses = ["consensus reached", "voice"]
+    right_fake.responses = ["consensus reached"]
+
+    response = client.post("/v1/chat", json={"message": "hi"})
+    assert response.status_code == 200, response.text
+
+    # Pass 0 system message on both hemispheres should carry the
+    # substrate note even though the orchestrator's default app
+    # fixture has identity OFF (the note is independent of identity).
+    pass0_left_system = next(
+        (m for m in left_fake.calls[0].messages if m.role.value == "system"), None
+    )
+    assert pass0_left_system is not None
+    # The substrate note's defining sentence — checked verbatim so a
+    # rewrite that loses the tag definition fails this test loudly.
+    assert "<parallel_thread>" in pass0_left_system.content
+    assert "substrate" in pass0_left_system.content.lower()
+
+
+def test_cross_pass_prefix_mode_falls_back_to_v020_shape(
+    client: TestClient,
+    left_fake: FakeHemisphereClient,
+    right_fake: FakeHemisphereClient,
+) -> None:
+    """Operator can switch crossPassFraming back to `prefix` to A/B
+    compare against the v0.2.0 behavior. In that mode: no tags appear
+    in cross-pass messages, no substrate note in system prompt."""
+    patch = client.patch("/v1/config", json={"crossPassFraming": "prefix"})
+    assert patch.status_code == 200, patch.text
+
+    left_fake.responses = ["alpha alpha", "beta beta", "voice"]
+    right_fake.responses = ["xenon xenon", "yttrium yttrium"]
+
+    response = client.post("/v1/chat", json={"message": "hi", "maxPasses": 2})
+    assert response.status_code == 200, response.text
+
+    # Pass 0 system: no substrate note.
+    pass0_left_system = next(
+        (m for m in left_fake.calls[0].messages if m.role.value == "system"), None
+    )
+    assert pass0_left_system is not None
+    assert "<parallel_thread>" not in pass0_left_system.content
+
+    # Pass 1 cross-pass: v0.2.0 prefix shape, no tags.
+    pass1_messages = left_fake.calls[1].messages
+    twin_carrier = next(
+        (m for m in pass1_messages if m.role.value == "user" and "xenon" in m.content),
+        None,
+    )
+    assert twin_carrier is not None
+    assert "<parallel_thread>" not in twin_carrier.content
+    assert "You also considered" in twin_carrier.content
+
+
 def test_agreement_directive_bands_distinct() -> None:
     """The agreement-to-register helper must return materially different
     directives across its three bands.

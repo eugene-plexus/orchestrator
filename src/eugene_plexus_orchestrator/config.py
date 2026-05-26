@@ -244,6 +244,31 @@ FIELDS: list[ConfigField] = [
         maximum=1.0,
     ),
     ConfigField(
+        key="crossPassFraming",
+        label="Cross-pass framing",
+        description=(
+            "How each hemisphere sees its twin's output between "
+            "deliberation passes. `parallel_thread` wraps the twin's "
+            "content in <parallel_thread>...</parallel_thread> tags "
+            "and appends an explanation of those tags to each "
+            "hemisphere's system prompt — the model has explicit "
+            "semantics that this is substrate, not user speech. "
+            "`prefix` is the v0.2.0 behavior: the twin's content "
+            "appears in a user-role message prefixed with \"You also "
+            "considered this...\". Both forms reach the LLM via the "
+            "same user-role wire shape, but the `parallel_thread` tag "
+            "+ system-prompt definition gives the model a stronger "
+            "signal that the content isn't conversation. Switch to "
+            "`prefix` to A/B compare or if the substrate framing "
+            "confuses a particular model."
+        ),
+        category="bicameral",
+        valueType=ConfigValueType.enum,
+        default="parallel_thread",
+        enumValues=["parallel_thread", "prefix"],
+        enumLabels=["Parallel thread tags", "User-message prefix"],
+    ),
+    ConfigField(
         key="agreementModel",
         label="Agreement scoring model",
         description=(

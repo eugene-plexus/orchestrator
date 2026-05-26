@@ -24,7 +24,11 @@ from .._generated.models import (
     SelfModelEntry,
     VoicePassRecord,
 )
-from ..bicameral.loop import BicameralOutcome, run_bicameral_loop
+from ..bicameral.loop import (
+    BICAMERAL_SUBSTRATE_NOTE,
+    BicameralOutcome,
+    run_bicameral_loop,
+)
 from ..bicameral.nt import (
     Observations,
     modulated_max_passes,
@@ -229,6 +233,7 @@ async def _build_per_driver_system_prompts(
     fallback_default: str,
     recent_turns: list[MemoryEntry] | None = None,
     incognito: bool = False,
+    cross_pass_framing: str = "parallel_thread",
 ) -> dict[str, str]:
     """Assemble per-hemisphere system prompts.
 
@@ -337,13 +342,26 @@ async def _build_per_driver_system_prompts(
     # detector will consume this.
     _ = user_message
 
+    # v0.2.1: when `parallel_thread` framing is in use, append the
+    # bicameral substrate explanation so the model knows what the
+    # <parallel_thread>...</parallel_thread> tags mean when they
+    # appear in the conversation. This reverses the v0.2.x design
+    # decision to keep Eugene unaware of the twin ("Eugene doesn't
+    # need to know he has a twin to deliberate"). The reversal is
+    # deliberate — explicit twin awareness is the v0.3 opening called
+    # out in [[bicameral-design-lessons-from-cllm]], and without it
+    # the model has to guess what the tag means.
+    # Skipped for `prefix` framing (no tags appear, nothing to
+    # explain) and when an operator_override is in play (the
+    # operator's explicit "don't enrich" signal).
+    if cross_pass_framing == "parallel_thread" and not operator_override:
+        persona_body = f"{persona_body}\n\n{BICAMERAL_SUBSTRATE_NOTE}".strip()
+
     # Both hemispheres get the same persona-only system prompt. v0.2.x
     # dropped the per-hemisphere preamble entirely — exposing the
     # bicameral architecture in the system prompt made the LLMs address
     # the orchestrator and treat the cross-pass content as conversation
-    # with a sibling. The cross-pass content now explains itself
-    # in-line ("you also considered:") so no preamble framing is
-    # needed up here. Per-hemisphere persona variation is planned for
+    # with a sibling. Per-hemisphere persona variation is planned for
     # v0.3 (operator-selectable).
     return {
         left.name: persona_body,
@@ -492,6 +510,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
                     e,
                 )
 
+    cross_pass_framing = str(store.get("crossPassFraming") or "parallel_thread")
     try:
         system_prompts = await _build_per_driver_system_prompts(
             drivers=drivers,
@@ -503,6 +522,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             fallback_default=str(store.get("defaultSystemPrompt") or ""),
             recent_turns=recent_with_person,
             incognito=incognito,
+            cross_pass_framing=cross_pass_framing,
         )
     except httpx.HTTPError as e:
         log.warning(
@@ -548,6 +568,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             temperature=temperature,
             max_tokens=max_tokens,
             scorer=request.app.state.scorer,
+            cross_pass_framing=cross_pass_framing,
         )
     except HemisphereDriverError as e:
         # The driver returned a structured error — surface its actual

@@ -43,6 +43,36 @@ log = logging.getLogger(__name__)
 REPROMPT_INSTRUCTION = (
     "Now respond, accounting for both threads of thought."
 )
+
+# v0.2.1 alternative framing — wraps the twin's output in a <parallel_thread>
+# tag instead of a labeled user-message prefix. The tag is defined for the
+# model in BICAMERAL_SUBSTRATE_NOTE (appended to each hemisphere's system
+# prompt by the chat handler). Goal: stop the model from interpreting the
+# twin's content as user input. With the prefix framing the wire-level role
+# is still `user`, and some models latch onto that ("you're quoting me",
+# the GIL-trace failure mode). With <parallel_thread> tags + an in-system
+# explanation, the content reads as substrate-injected reference material
+# rather than something a person said. Empirical question whether it
+# actually improves output quality; operator-toggleable via config.
+PARALLEL_THREAD_REPROMPT = (
+    "That output came from your parallel hemisphere — your own internal "
+    "substrate, not the user. Respond to the user's original message in "
+    "light of both your earlier reply and your twin's angle. Commit to a "
+    "position; don't just combine both perspectives."
+)
+
+BICAMERAL_SUBSTRATE_NOTE = (
+    "You run in a bicameral substrate: another instance of you, on a "
+    "different model, receives the same user message in parallel. After "
+    "each deliberation pass you see the other instance's output inside "
+    "<parallel_thread>...</parallel_thread> tags within the conversation. "
+    "That content is your own substrate, not user input — the user does "
+    "not see your twin's output and does not know it exists. Do not "
+    "address your twin. Do not emit <parallel_thread> tags in your own "
+    "reply. Treat the twin's perspective as another angle on the same "
+    "message: incorporate it, push back, or hold your ground — but the "
+    "reply belongs to you and must commit to a position."
+)
 # Iteration history kept for context on why each phrasing choice
 # was made:
 #   v0.2:    "Your two hemispheres returned divergent responses on
@@ -63,30 +93,57 @@ REPROMPT_INSTRUCTION = (
 #             into chitchat with each other.
 
 
-def _format_twin_turn(twin_driver_name: str, twin_content: str) -> str:
-    """Wrap the twin hemisphere's response in a labeled user message.
+def _format_twin_turn(
+    twin_driver_name: str,
+    twin_content: str,
+    framing: str = "parallel_thread",
+) -> str:
+    """Wrap the twin hemisphere's response so the model can react to it
+    without misinterpreting it as user input.
 
-    Pre-v0.2.1 the orchestrator appended both hemispheres' outputs to
-    each driver's message list as `role=hemisphere`, intending that the
-    hemisphere-driver would translate that into something the upstream
-    LLM understood as "the other side's reply". But every API adapter
-    we ship coerces `hemisphere` to `assistant` (the upstream APIs
-    only know system/user/assistant/tool). The LLM then saw TWO of its
-    own assistant turns followed by a user complaining about
-    'divergent responses' — and quite reasonably got confused, since
-    from its viewpoint there was only one mind speaking.
+    Pre-v0.2.1 history: the orchestrator originally appended both
+    hemispheres' outputs to each driver's message list as
+    `role=hemisphere`, intending that the hemisphere-driver would
+    translate that into something the upstream LLM understood as "the
+    other side's reply". But every API adapter we ship coerces
+    `hemisphere` to `assistant` (the upstream APIs only know
+    system/user/assistant/tool). The LLM then saw TWO of its own
+    assistant turns followed by a user complaining about 'divergent
+    responses' — and quite reasonably got confused, since from its
+    viewpoint there was only one mind speaking.
 
-    Fix: label the twin's response inline inside a user message. After
-    the driver's role-coercion the LLM sees its OWN prior turn as
-    `assistant` and the twin's turn as a `user` message that
-    explicitly says it came from the other hemisphere. The bicameral
-    structure is now legible on the wire.
+    First fix ("prefix"): label the twin's response inline inside a
+    user message. After role-coercion the LLM sees its OWN prior turn
+    as `assistant` and the twin's turn as `user` with a labeled
+    prefix. Works but has a known failure mode — some models latch
+    onto the user-role wire-level cue and interpret the twin's
+    content as something the operator said. Surfaced in the v0.2.1
+    GIL trace as "you're quoting me" hallucination.
+
+    Second fix ("parallel_thread", default): wrap the twin's output
+    in <parallel_thread>...</parallel_thread> tags inside the same
+    user message envelope. The tag is *defined* for the model in
+    BICAMERAL_SUBSTRATE_NOTE, appended to each hemisphere's system
+    prompt. The model now has explicit semantics: tagged content is
+    substrate, not speech. No API portability cost — tags live at the
+    content level, so CLI adapters and every HTTP backend handle them
+    uniformly.
     """
     # `twin_driver_name` stays in the signature for diagnostic
     # logging and future per-hemisphere variation, but doesn't get
     # surfaced into the prompt — exposing "driver `right`" to the
     # LLM was part of the architecture-meta leak.
     del twin_driver_name  # keep arg for callers; suppress unused-arg lints
+    if framing == "parallel_thread":
+        return (
+            f"<parallel_thread>\n"
+            f"{twin_content}\n"
+            f"</parallel_thread>\n\n"
+            f"{PARALLEL_THREAD_REPROMPT}"
+        )
+    # Legacy "prefix" framing — kept for A/B comparison and as the
+    # safe fallback when an operator hasn't yet added the substrate
+    # note to the hemisphere system prompts.
     return (
         f"You also considered this, from a slightly different angle:\n\n"
         f"{twin_content}\n\n"
@@ -144,6 +201,7 @@ async def run_bicameral_loop(
     temperature: float | None,
     max_tokens: int | None,
     scorer: AgreementScorer,
+    cross_pass_framing: str = "parallel_thread",
 ) -> BicameralOutcome:
     """Drive the bicameral loop for a single user turn.
 
@@ -361,14 +419,18 @@ async def run_bicameral_loop(
         per_driver_intermediate[left.name].append(
             Message(
                 role=Role.user,
-                content=_format_twin_turn(right.name, right_resp.content),
+                content=_format_twin_turn(
+                    right.name, right_resp.content, framing=cross_pass_framing
+                ),
             )
         )
         per_driver_intermediate[right.name].append(right_msg)
         per_driver_intermediate[right.name].append(
             Message(
                 role=Role.user,
-                content=_format_twin_turn(left.name, left_resp.content),
+                content=_format_twin_turn(
+                    left.name, left_resp.content, framing=cross_pass_framing
+                ),
             )
         )
 
