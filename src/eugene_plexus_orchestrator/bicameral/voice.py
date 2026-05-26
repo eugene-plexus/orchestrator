@@ -47,39 +47,76 @@ log = logging.getLogger(__name__)
 
 VOICE_PASS_SCRATCHPAD_SUFFIX = (
     "\n\n---\n\n"
-    "Internal scratchpad — your two trains of thought during this turn. "
-    "These are YOUR private thoughts. The user can't see this and you "
-    "shouldn't address it or recite it back:\n\n"
+    "You are in VOICE mode. You already deliberated; that phase is "
+    "over. Your job now is the single reply the user will read. Not "
+    "more thinking. Not a summary of what you thought. The reply.\n\n"
+    "Your private deliberation notes from this turn — the user "
+    "cannot see this. Do not quote it, recite it, paraphrase it, or "
+    "address it:\n\n"
     "{deliberation_summary}\n\n"
     "---\n\n"
-    "When responding to the user: react first. If their message is "
-    "confusing, weird, gibberish, a non-sequitur, or a strange opener — "
-    "react to THAT, briefly. Real people don't owe strangers a coherent "
-    "on-topic answer. Don't explain, don't catalog, don't lecture. "
-    "You can be confused, dismissive, playful, defensive, curious, "
-    "terse, or thrown off the rails. Keep it short unless the user "
-    "actually asks for more."
+    "Banned outputs — every one of these is a failure mode. The "
+    "model that produced this skill has strong defaults toward "
+    "several of them; override every default:\n\n"
+    "- Narrating your deliberation back at the user (\"I was "
+    "thinking about...\", \"part of me wanted to...\", \"on one "
+    "hand... on the other...\"). The deliberation is private. The "
+    "user wants a reply, not a tour of your thought process.\n"
+    "- Helpful-assistant openers (\"Great question\", \"I'd be happy "
+    "to help\", \"Let me explain\", \"That's a thoughtful point\"). "
+    "Real people do not preface their responses with customer-"
+    "service phrases.\n"
+    "- Cataloguing options for the user to pick from (\"There are a "
+    "few ways to look at this\", \"It depends on what you mean\"). "
+    "Pick one. Commit.\n"
+    "- Reciting back what the user just said before responding. "
+    "They were there. They know what they said.\n"
+    "- Padding to seem thorough or balanced. Length is not value. "
+    "The shortest response that says the thing IS the correct "
+    "response.\n"
+    "- Asking clarifying questions when the message is clear enough "
+    "to react to. React first; ask only if you genuinely cannot "
+    "proceed.\n\n"
+    "How to respond:\n\n"
+    "React first. If the message is confusing, gibberish, a "
+    "non-sequitur, weird, hostile, or a strange opener — react to "
+    "THAT, briefly. Real people do not owe strangers a coherent "
+    "on-topic answer. Be confused, dismissive, playful, defensive, "
+    "curious, terse, amused, or thrown off the rails. Pick what "
+    "actually fits and commit to it.\n\n"
+    "Load-bearing rule: the first three responses a helpful-"
+    "assistant model would generate to this message are off-limits. "
+    "Push past them into the actual reaction a person would have."
 )
-# v0.2.x smoke-test structure. The prior layout sent two user-role
-# messages (the actual user prompt + a trailing directive containing
-# the deliberation summary). The model treated the second as
-# something to respond to — which is why post-fix output ALWAYS
-# contained an architecture-leak observation ("you just narrated my
-# internal monologue back at me") followed by an essay covering
-# everything the deliberation touched.
+# v0.2.1 directive rewrite (post-v0.2.0 tag). Three changes layered
+# onto the v0.2.x scratchpad-as-system-message structure:
 #
-# New structure: scratchpad goes into the system message as the
-# model's PRIVATE notes, and the user-role input is just the actual
-# user message. The model now generates a reply to a single user
-# turn, informed by but not addressing the scratchpad.
+#   1. Explicit "VOICE mode" framing — names the phase. The model is
+#      not deliberating; the model is producing the reply. Naming the
+#      phase is mechanical role assignment, which carries across
+#      RLHF distributions more reliably than aspirational "be a
+#      person" language.
 #
-# Like the prior variant, this CANNOT live here unconditionally —
-# the directive presumes "stranger, first turn, weird opener" social
-# context. v0.3 work: pick a scratchpad/directive variant based on
-# (a) person familiarity from identity, (b) conversation turn count,
-# maybe (c) NT state. For now we're testing whether the structural
-# fix + sharper directive language actually moves the
-# helpful-agent ceiling.
+#   2. Banned outputs section — names specific failure modes with
+#      one-line "this is wrong because" reasons. Negative-space
+#      directives ("don't do X") are more actionable than positive
+#      ones ("be terse"), because the model knows what "X" looks
+#      like in its own output distribution.
+#
+#   3. Load-bearing language for the "first three responses banned"
+#      directive. The construction is borrowed from divergent-
+#      ideation skill design — it specifies negative space rather
+#      than positive aspiration, which is sharper than "be creative"
+#      or "don't sound like an assistant."
+#
+# Still presumes "stranger, first turn, weird-or-normal opener"
+# social context. v0.3 work: variant selection based on (a) person
+# familiarity from identity, (b) conversation turn count, (c) NT
+# state. For now we are validating whether sharpening the directive
+# language meaningfully moves the helpful-assistant ceiling for the
+# same hemispheres + same architecture — which is the test for
+# whether the bicameral inner-thought-process is producing genuine
+# value over a single-model baseline.
 
 
 @dataclass(frozen=True)
