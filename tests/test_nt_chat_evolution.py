@@ -98,9 +98,7 @@ def test_high_cortisol_widens_modulated_max_passes(
     app.state.nt_state = base.model_copy(
         update={
             "cortisol": NTLevel(level=1.0, baseline=0.5, decay=base.cortisol.decay),
-            "norepinephrine": NTLevel(
-                level=1.0, baseline=0.5, decay=base.norepinephrine.decay
-            ),
+            "norepinephrine": NTLevel(level=1.0, baseline=0.5, decay=base.norepinephrine.decay),
         }
     )
 

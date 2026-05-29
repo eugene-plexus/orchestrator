@@ -103,9 +103,7 @@ def _build_memory_entry(
     )
 
 
-def _build_observations(
-    outcome: BicameralOutcome, agreement_threshold: float
-) -> Observations:
+def _build_observations(outcome: BicameralOutcome, agreement_threshold: float) -> Observations:
     """Distill the bicameral outcome into NT-system observations.
 
     Final-pass agreement, whether termination was convergence vs cap,
@@ -216,9 +214,7 @@ def _render_relationship(summary: RelationshipSummary, person: Person | None) ->
     if summary.summary:
         parts.append(summary.summary)
     elif summary.turnCount and summary.turnCount > 0:
-        parts.append(
-            f"You've shared {summary.turnCount} prior turn(s) with this person."
-        )
+        parts.append(f"You've shared {summary.turnCount} prior turn(s) with this person.")
     return "\n".join(parts)
 
 
@@ -284,9 +280,11 @@ async def _build_per_driver_system_prompts(
         self_model_entries = await self_model_task
         relationship = await relationship_task if relationship_task is not None else None
         persons = await persons_task if persons_task is not None else []
-        person_record = next(
-            (p for p in persons if p.personId == effective_person_id), None
-        ) if effective_person_id is not None else None
+        person_record = (
+            next((p for p in persons if p.personId == effective_person_id), None)
+            if effective_person_id is not None
+            else None
+        )
 
         sections: list[str] = [_render_constitution(constitution)]
         sm_text = _render_self_model(self_model_entries)
@@ -417,9 +415,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             # degrade to no-person-context and continue.
             operator_person_id = None
     effective_person_id = (
-        NIL_PERSON_ID
-        if incognito
-        else (body.personId or operator_person_id or NIL_PERSON_ID)
+        NIL_PERSON_ID if incognito else (body.personId or operator_person_id or NIL_PERSON_ID)
     )
 
     # NT state evolves across turns; the chat handler reads the current
@@ -626,24 +622,16 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     # reply.
     voice_driver = _resolve_voice_driver(drivers, store.get("voiceDriver"))
     voice_temp_cfg = store.get("voiceTemperature")
-    voice_temperature = (
-        float(voice_temp_cfg) if voice_temp_cfg is not None else temperature
-    )
-    deliberation_finals = (
-        outcome.passes[-1].hemispheres if outcome.passes else []
-    )
+    voice_temperature = float(voice_temp_cfg) if voice_temp_cfg is not None else temperature
+    deliberation_finals = outcome.passes[-1].hemispheres if outcome.passes else []
     # The agreement score from the final pass becomes Eugene's
     # internal-certainty signal in the voice pass. High agreement →
     # confident register; low agreement → tentative / of-two-minds
     # register. This is the architectural payoff of the bicameral
     # loop: the "did my two minds agree?" measurement actually shapes
     # how Eugene sounds. A single-driver agent has no analogous axis.
-    final_agreement = (
-        outcome.passes[-1].callosum.agreement if outcome.passes else 0.5
-    )
-    voice_persona = system_prompts.get(voice_driver.name) or next(
-        iter(system_prompts.values()), ""
-    )
+    final_agreement = outcome.passes[-1].callosum.agreement if outcome.passes else 0.5
+    voice_persona = system_prompts.get(voice_driver.name) or next(iter(system_prompts.values()), "")
     try:
         voice_outcome = await run_voice_pass(
             voice_driver=voice_driver,
@@ -671,8 +659,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
                 title="Voice pass failed",
                 status=502,
                 detail=(
-                    f"{upstream.detail if upstream else e.raw_body[:500]} "
-                    f"(driver={e.driver_name})"
+                    f"{upstream.detail if upstream else e.raw_body[:500]} (driver={e.driver_name})"
                 ),
                 component="orchestrator",
             ).model_dump(exclude_none=True),

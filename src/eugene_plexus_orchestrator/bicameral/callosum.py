@@ -160,7 +160,7 @@ def load_default_scorer(model_name: str = "all-MiniLM-L6-v2") -> AgreementScorer
             model_name,
         )
         return scorer
-    except Exception as e:  # noqa: BLE001 — degraded-mode fallback
+    except Exception as e:
         log.warning(
             "could not load embedding scorer %r (%s); "
             "falling back to Jaccard word-overlap. Chat will still work, "

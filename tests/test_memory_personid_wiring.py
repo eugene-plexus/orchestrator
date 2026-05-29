@@ -215,9 +215,7 @@ def test_chat_injects_recent_turns_from_prior_conversations(
     # System message in each hemisphere's GenerateRequest carries the
     # prior-conversation recap.
     for fake in (left_fake, right_fake):
-        sys_msg = next(
-            m.content for m in fake.calls[0].messages if m.role == Role.system
-        )
+        sys_msg = next(m.content for m in fake.calls[0].messages if m.role == Role.system)
         assert "cats last week" in sys_msg
         assert "favorite species" in sys_msg
         assert "Recent turns with this person" in sys_msg
@@ -260,7 +258,5 @@ def test_chat_skips_recent_turns_for_nil_person(
     assert response.status_code == 200, response.text
 
     for fake in (left_fake, right_fake):
-        sys_msg = next(
-            m.content for m in fake.calls[0].messages if m.role == Role.system
-        )
+        sys_msg = next(m.content for m in fake.calls[0].messages if m.role == Role.system)
         assert "UNRELATED_NIL_BUCKET_LEAK_CANARY" not in sys_msg

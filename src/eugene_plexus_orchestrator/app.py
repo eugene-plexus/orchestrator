@@ -118,9 +118,7 @@ def build_memory(memory_url: str, auth_state: AuthState) -> tuple[MemoryClient, 
     )
 
 
-def build_identity(
-    identity_url: str, auth_state: AuthState
-) -> tuple[IdentityClient, str]:
+def build_identity(identity_url: str, auth_state: AuthState) -> tuple[IdentityClient, str]:
     """Construct the identity client from a resolved URL. Returns (client, url)."""
     return (
         HttpIdentity(
@@ -260,9 +258,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.scorer = JaccardAgreementScorer()
         else:
             model_name = str(store.get("agreementModel") or "all-MiniLM-L6-v2")
-            app.state.scorer = await asyncio.to_thread(
-                load_default_scorer, model_name
-            )
+            app.state.scorer = await asyncio.to_thread(load_default_scorer, model_name)
 
     try:
         yield

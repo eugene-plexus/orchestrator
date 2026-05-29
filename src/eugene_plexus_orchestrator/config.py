@@ -49,9 +49,9 @@ DEFAULT_DRIVERS: list[dict[str, str]] = [
 DEFAULT_SYSTEM_PROMPT = (
     "You are Eugene. You are a person, not an AI assistant.\n\n"
     "Format requirements:\n"
-    "- Respond in first person (\"I\"), as if speaking aloud.\n"
-    "- Never write speaker labels (\"Eugene:\", \"Kenneth:\", "
-    "\"Assistant:\", \"User:\", etc.)\n"
+    '- Respond in first person ("I"), as if speaking aloud.\n'
+    '- Never write speaker labels ("Eugene:", "Kenneth:", '
+    '"Assistant:", "User:", etc.)\n'
     "- Never generate dialog scripts, play formats, or third-person "
     "narration of yourself.\n"
     "- One contiguous response per turn — not a scene.\n\n"
@@ -97,10 +97,10 @@ FIELDS: list[ConfigField] = [
         key="drivers",
         label="Drivers",
         description=(
-            "The list of LLM drivers (\"hemispheres\") the orchestrator "
+            'The list of LLM drivers ("hemispheres") the orchestrator '
             "talks to on every chat turn. Each entry has a `name` "
-            "(free-form label, e.g. \"left\" / \"right\" / \"claude\" / "
-            "\"local-llama\" — appears on the UI's tabs and beside that "
+            '(free-form label, e.g. "left" / "right" / "claude" / '
+            '"local-llama" — appears on the UI\'s tabs and beside that '
             "driver's outputs) and a `url` picked from the watchdog "
             "topology dropdown. v0.1's bicameral loop requires exactly "
             "two entries; v0.2+ will generalize to N with backup/"
@@ -209,7 +209,7 @@ FIELDS: list[ConfigField] = [
         description=(
             "Hard cap on how many times the orchestrator will re-prompt "
             "the hemispheres before giving up and returning a blended "
-            "response anyway. Each \"pass\" sends the conversation to "
+            'response anyway. Each "pass" sends the conversation to '
             "every driver in parallel and scores how much they agree; "
             "if they disagree, another pass runs. Higher values give "
             "the system more chances to converge on a unified answer at "
@@ -227,7 +227,7 @@ FIELDS: list[ConfigField] = [
         label="Agreement threshold",
         description=(
             "How much semantic agreement two driver responses need "
-            "before the orchestrator considers them \"in agreement\" "
+            'before the orchestrator considers them "in agreement" '
             "and stops looping. v0.2.x scores by cosine similarity of "
             "sentence-transformer embeddings — picks up paraphrases "
             "that mean the same thing in different words. 0.0 is no "
@@ -254,8 +254,8 @@ FIELDS: list[ConfigField] = [
             "hemisphere's system prompt — the model has explicit "
             "semantics that this is substrate, not user speech. "
             "`prefix` is the v0.2.0 behavior: the twin's content "
-            "appears in a user-role message prefixed with \"You also "
-            "considered this...\". Both forms reach the LLM via the "
+            'appears in a user-role message prefixed with "You also '
+            'considered this...". Both forms reach the LLM via the '
             "same user-role wire shape, but the `parallel_thread` tag "
             "+ system-prompt definition gives the model a stronger "
             "signal that the content isn't conversation. Switch to "
@@ -401,9 +401,7 @@ def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
     """
     if driver_names:
         fields = [
-            _with_voice_driver_suggestions(f, driver_names)
-            if f.key == "voiceDriver"
-            else f
+            _with_voice_driver_suggestions(f, driver_names) if f.key == "voiceDriver" else f
             for f in FIELDS
         ]
     else:
@@ -415,9 +413,7 @@ def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
     )
 
 
-def _with_voice_driver_suggestions(
-    field: ConfigField, driver_names: list[str]
-) -> ConfigField:
+def _with_voice_driver_suggestions(field: ConfigField, driver_names: list[str]) -> ConfigField:
     """Return a copy of `voiceDriver` carrying the configured driver
     names as discovery suggestions. valueType stays `string` so the
     operator can paste a name that isn't in topology yet (test-time

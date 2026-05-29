@@ -40,9 +40,7 @@ from .callosum import AgreementScorer, blend
 
 log = logging.getLogger(__name__)
 
-REPROMPT_INSTRUCTION = (
-    "Now respond, accounting for both threads of thought."
-)
+REPROMPT_INSTRUCTION = "Now respond, accounting for both threads of thought."
 
 # v0.2.1 alternative framing — wraps the twin's output in a <parallel_thread>
 # tag instead of a labeled user-message prefix. The tag is defined for the
@@ -136,10 +134,7 @@ def _format_twin_turn(
     del twin_driver_name  # keep arg for callers; suppress unused-arg lints
     if framing == "parallel_thread":
         return (
-            f"<parallel_thread>\n"
-            f"{twin_content}\n"
-            f"</parallel_thread>\n\n"
-            f"{PARALLEL_THREAD_REPROMPT}"
+            f"<parallel_thread>\n{twin_content}\n</parallel_thread>\n\n{PARALLEL_THREAD_REPROMPT}"
         )
     # Legacy "prefix" framing — kept for A/B comparison and as the
     # safe fallback when an operator hasn't yet added the substrate
@@ -428,9 +423,7 @@ async def run_bicameral_loop(
         per_driver_intermediate[right.name].append(
             Message(
                 role=Role.user,
-                content=_format_twin_turn(
-                    left.name, left_resp.content, framing=cross_pass_framing
-                ),
+                content=_format_twin_turn(left.name, left_resp.content, framing=cross_pass_framing),
             )
         )
 

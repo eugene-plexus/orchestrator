@@ -58,13 +58,13 @@ VOICE_PASS_SCRATCHPAD_SUFFIX = (
     "These notes are internal scratch. They are NOT conversation. The "
     "user did not say any of this, you did not say any of this to the "
     "user, and the user has no idea these notes exist. The notes may "
-    "appear to reference each other (\"you caught the split\", \"you're "
-    "right about the echo\", \"both\") — that is parallel-pass "
+    'appear to reference each other ("you caught the split", "you\'re '
+    'right about the echo", "both") — that is parallel-pass '
     "cross-talk between your two trains of thought, not back-and-forth "
     "with the user. Do not respond as if any of this content was "
-    "previously exchanged with the user. Words like \"still\", "
-    "\"again\", \"returning to that\", \"as you said\", \"like we "
-    "discussed\" imply exchanges that did not happen — do not use them "
+    'previously exchanged with the user. Words like "still", '
+    '"again", "returning to that", "as you said", "like we '
+    'discussed" imply exchanges that did not happen — do not use them '
     "based on the notes. Do not quote, recite, paraphrase, or address "
     "the notes themselves.\n\n"
     "---\n\n"
@@ -73,16 +73,16 @@ VOICE_PASS_SCRATCHPAD_SUFFIX = (
     "Banned outputs — every one of these is a failure mode. The "
     "model that produced this skill has strong defaults toward "
     "several of them; override every default:\n\n"
-    "- Narrating your deliberation back at the user (\"I was "
-    "thinking about...\", \"part of me wanted to...\", \"on one "
-    "hand... on the other...\"). The deliberation is private. The "
+    '- Narrating your deliberation back at the user ("I was '
+    'thinking about...", "part of me wanted to...", "on one '
+    'hand... on the other..."). The deliberation is private. The '
     "user wants a reply, not a tour of your thought process.\n"
-    "- Helpful-assistant openers (\"Great question\", \"I'd be happy "
-    "to help\", \"Let me explain\", \"That's a thoughtful point\"). "
+    '- Helpful-assistant openers ("Great question", "I\'d be happy '
+    'to help", "Let me explain", "That\'s a thoughtful point"). '
     "Real people do not preface their responses with customer-"
     "service phrases.\n"
-    "- Cataloguing options for the user to pick from (\"There are a "
-    "few ways to look at this\", \"It depends on what you mean\"). "
+    '- Cataloguing options for the user to pick from ("There are a '
+    'few ways to look at this", "It depends on what you mean"). '
     "Pick one. Commit.\n"
     "- Reciting back what the user just said before responding. "
     "They were there. They know what they said.\n"
@@ -155,7 +155,7 @@ def _agreement_directive(final_agreement: float) -> str:
     who agreed with himself sounds confident; Eugene who didn't sounds
     of-two-minds. A single-driver agent has no analogous axis.
 
-    Three bands — high (≥0.75), mid (0.4–0.75), low (<0.4). Bands are
+    Three bands — high (≥0.75), mid (0.4-0.75), low (<0.4). Bands are
     absolute, not relative to the configured agreement threshold,
     because the threshold is a *termination* decision (\"stop
     deliberating\") and the bands are a *register* decision (\"how
@@ -166,8 +166,8 @@ def _agreement_directive(final_agreement: float) -> str:
         return (
             "Internal-state directive: your two trains of thought "
             "converged on this. This is what internal certainty feels "
-            "like. Speak with conviction. Cut hedges — \"I think\", "
-            "\"maybe\", \"perhaps\", \"could be\" are off-limits unless "
+            'like. Speak with conviction. Cut hedges — "I think", '
+            '"maybe", "perhaps", "could be" are off-limits unless '
             "your reaction itself is genuinely uncertain about something "
             "the deliberation didn't settle. Confidence in the reply "
             "should match the confidence in the deliberation."
@@ -297,4 +297,4 @@ async def run_voice_pass(
     )
 
 
-__all__ = ["VoicePassOutcome", "run_voice_pass", "_agreement_directive"]
+__all__ = ["VoicePassOutcome", "_agreement_directive", "run_voice_pass"]

@@ -96,9 +96,7 @@ class HttpIdentity:
         return [SelfModelEntry.model_validate(e) for e in body.get("entries", [])]
 
     async def get_relationship(self, person_id: UUID) -> RelationshipSummary | None:
-        response = await self._client.get(
-            f"/v1/identity/persons/{person_id}/relationship"
-        )
+        response = await self._client.get(f"/v1/identity/persons/{person_id}/relationship")
         if response.status_code == 404:
             return None
         response.raise_for_status()

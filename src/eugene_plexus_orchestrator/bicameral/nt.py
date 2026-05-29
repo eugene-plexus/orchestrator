@@ -39,12 +39,12 @@ from .._generated.models import NTLevel, NTState
 # Decays expressed as "natural log decay constant per second" — the
 # half-life is ln(2) / decay.
 _DEFAULT_DECAYS: dict[str, float] = {
-    "dopamine": 0.010,        # ~70s half-life
-    "serotonin": 0.001,       # ~11min half-life
+    "dopamine": 0.010,  # ~70s half-life
+    "serotonin": 0.001,  # ~11min half-life
     "norepinephrine": 0.020,  # ~35s half-life
-    "gaba": 0.005,            # ~2.3min half-life
-    "cortisol": 0.002,        # ~5.7min half-life
-    "acetylcholine": 0.010,   # ~70s half-life
+    "gaba": 0.005,  # ~2.3min half-life
+    "cortisol": 0.002,  # ~5.7min half-life
+    "acetylcholine": 0.010,  # ~70s half-life
 }
 
 
@@ -183,24 +183,16 @@ def tick(
     """
     now = now or datetime.now(UTC)
     elapsed_seconds = (now - state.lastUpdated).total_seconds()
-    impulse = (
-        _impulses_from_observations(observations)
-        if observations is not None
-        else _Impulse()
-    )
+    impulse = _impulses_from_observations(observations) if observations is not None else _Impulse()
 
     return NTState(
         lastUpdated=now,
         dopamine=_apply(state.dopamine, impulse.dopamine, elapsed_seconds),
         serotonin=_apply(state.serotonin, impulse.serotonin, elapsed_seconds),
-        norepinephrine=_apply(
-            state.norepinephrine, impulse.norepinephrine, elapsed_seconds
-        ),
+        norepinephrine=_apply(state.norepinephrine, impulse.norepinephrine, elapsed_seconds),
         gaba=_apply(state.gaba, impulse.gaba, elapsed_seconds),
         cortisol=_apply(state.cortisol, impulse.cortisol, elapsed_seconds),
-        acetylcholine=_apply(
-            state.acetylcholine, impulse.acetylcholine, elapsed_seconds
-        ),
+        acetylcholine=_apply(state.acetylcholine, impulse.acetylcholine, elapsed_seconds),
     )
 
 
@@ -238,9 +230,7 @@ def modulated_max_passes(state: NTState, base_max_passes: int) -> int:
     return max(1, min(_HARD_MAX_PASSES, boosted))
 
 
-def modulated_temperature(
-    state: NTState, base_temperature: float | None
-) -> float | None:
+def modulated_temperature(state: NTState, base_temperature: float | None) -> float | None:
     """`temperature = base * (1 + 0.5*(dopamine-0.5) - 0.5*(gaba-0.5))`.
 
     At neutral NT, returns `base_temperature`. Dopamine pushes

@@ -81,9 +81,7 @@ def load_auth_state(
     base64) raises so the watchdog operator sees the failure rather
     than mysterious 401s downstream.
     """
-    signing_key = _decode_b64_key(
-        signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY"
-    )
+    signing_key = _decode_b64_key(signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY")
     master_key = _decode_b64_key(master_key_b64, expected_len=32, label="MASTER_KEY")
 
     if signing_key is None:

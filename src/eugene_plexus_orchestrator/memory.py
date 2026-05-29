@@ -89,8 +89,7 @@ class InProcessMemory:
         return Conversation(
             id=conversation_id,
             messages=[
-                Message(role=e.role, content=e.content, timestamp=e.timestamp)
-                for e in entries
+                Message(role=e.role, content=e.content, timestamp=e.timestamp) for e in entries
             ],
         )
 
@@ -108,9 +107,7 @@ class InProcessMemory:
             return None
         return Message(role=stored.role, content=stored.content, timestamp=stored.timestamp)
 
-    async def append_entry(
-        self, conversation_id: UUID, entry: MemoryEntry
-    ) -> MemoryEntry | None:
+    async def append_entry(self, conversation_id: UUID, entry: MemoryEntry) -> MemoryEntry | None:
         if conversation_id not in self._conversations:
             return None
         stored = entry.model_copy(update={"conversationId": conversation_id})
@@ -213,9 +210,7 @@ class HttpMemory:
             timestamp=datetime.fromisoformat(body["timestamp"]),
         )
 
-    async def append_entry(
-        self, conversation_id: UUID, entry: MemoryEntry
-    ) -> MemoryEntry | None:
+    async def append_entry(self, conversation_id: UUID, entry: MemoryEntry) -> MemoryEntry | None:
         payload = entry.model_dump(mode="json", exclude_none=True)
         response = await self._client.post(
             f"/v1/conversations/{conversation_id}/messages",

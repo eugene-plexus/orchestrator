@@ -29,9 +29,7 @@ def _state_with_dopamine_level(level: float, when: datetime) -> NTState:
     return base.model_copy(
         update={
             "lastUpdated": when,
-            "dopamine": NTLevel(
-                level=level, baseline=0.5, decay=base.dopamine.decay
-            ),
+            "dopamine": NTLevel(level=level, baseline=0.5, decay=base.dopamine.decay),
         }
     )
 
@@ -140,9 +138,7 @@ def _state_with(**levels: float) -> NTState:
     update: dict[str, object] = {}
     for name, lvl in levels.items():
         existing: NTLevel = getattr(base, name)
-        update[name] = NTLevel(
-            level=lvl, baseline=existing.baseline, decay=existing.decay
-        )
+        update[name] = NTLevel(level=lvl, baseline=existing.baseline, decay=existing.decay)
     return base.model_copy(update=update)
 
 

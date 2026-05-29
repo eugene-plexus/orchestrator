@@ -25,7 +25,6 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import httpx
-import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_orchestrator._generated.hemisphere_models import (
@@ -349,9 +348,7 @@ def test_chat_degrades_when_identity_service_is_unreachable(
         ) -> list[SelfModelEntry]:
             raise httpx.ConnectError("identity dead")
 
-        async def get_relationship(
-            self, person_id: UUID
-        ) -> RelationshipSummary | None:
+        async def get_relationship(self, person_id: UUID) -> RelationshipSummary | None:
             raise httpx.ConnectError("identity dead")
 
         async def list_persons(self) -> list[Person]:
