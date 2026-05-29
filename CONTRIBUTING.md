@@ -45,6 +45,17 @@ pip install -e ".[dev]"
 
 To exercise the full stack you also need two `hemisphere-driver` instances reachable. See its [README](https://github.com/eugene-plexus/hemisphere-driver) for setup; configure orchestrator's `leftDriverUrl` and `rightDriverUrl` accordingly.
 
+## Git hooks
+
+We use [pre-commit](https://pre-commit.com/) to auto-format staged files with Ruff before they reach CI. Enable it once per clone:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+After that, `git commit` runs `ruff check --fix` and `ruff format` on staged Python files; if a hook reformats anything, re-stage and commit again.
+
 ## Style
 
 - **Python 3.12+**. Modern syntax; no `from __future__ import annotations` unless materially helpful.
