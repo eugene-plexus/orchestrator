@@ -93,8 +93,18 @@ async def test_config(
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or "<unnamed>")
-        url = str(entry.get("url") or "")
-        probes.append(probe(name, url, "/v1/info"))
+        # A slot is a priority list of backends (v0.2.1). Probe each URL
+        # so a misconfigured fallback is caught before it's ever needed.
+        # Tolerate the legacy single-`url` shape in case an override
+        # payload predates the migration. Label multi-backend slots
+        # `name[0]`, `name[1]`, … so the operator can tell them apart.
+        urls = entry.get("urls")
+        if not isinstance(urls, list) or not urls:
+            legacy = entry.get("url")
+            urls = [legacy] if legacy else []
+        for i, url in enumerate(urls):
+            label = name if len(urls) == 1 else f"{name}[{i}]"
+            probes.append(probe(label, str(url or ""), "/v1/info"))
 
     results = await asyncio.gather(*probes)
 

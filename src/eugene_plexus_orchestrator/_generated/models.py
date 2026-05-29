@@ -101,22 +101,33 @@ class NTLevel(BaseModel):
 
 class DriverEntry(BaseModel):
     """
-    One operator-configured hemisphere-driver in the orchestrator's
-    topology. The orchestrator owns the `name` (free-form, used for
-    labelling messages and UI tabs); drivers themselves are anonymous
-    and report only their backend / model identity. v0.1 expects two
-    entries; v0.2+ generalizes to N (with backup/failover semantics
-    layered on top).
+    One operator-configured hemisphere-driver *slot* in the
+    orchestrator's topology. The orchestrator owns the `name`
+    (free-form, used for labelling messages and UI tabs); drivers
+    themselves are anonymous and report only their backend / model
+    identity. The bicameral loop requires exactly two slots.
+
+    A slot is a **priority list** of backend URLs (`urls`), not a
+    single backend (v0.2.1). On each chat turn the orchestrator
+    tries `urls[0]`; if it fails in a cascade-eligible way
+    (transport error / 5xx / timeout) it falls through to
+    `urls[1]`, and so on. A 4xx fails the slot HARD without
+    cascading — a 4xx is a request/auth/config bug that the next
+    backend would hit identically, and cascading past it would
+    mask the real problem. Stock installs run one URL per slot, so
+    the list is length-1 and behaves exactly as the pre-v0.2.1
+    single-`url` shape did.
 
     """
 
     name: str = Field(
         ...,
-        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this driver\nproduces and surfaced in the UI as the tab/column label.\n',
+        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this slot\nproduces and surfaced in the UI as the tab/column label.\n',
         min_length=1,
     )
-    url: AnyUrl = Field(
-        ..., description="Base URL where the driver's HTTP API is reachable."
+    urls: list[AnyUrl] = Field(
+        ...,
+        description='Ordered priority list of base URLs where interchangeable\nbackends for this slot are reachable. The orchestrator\ntries them in order on each turn and cascades to the next\non transport error / 5xx / timeout (but not on 4xx). At\nleast one entry is required.\n',
     )
 
 
@@ -848,6 +859,23 @@ class CallosumState(BaseModel):
         ..., description='What the orchestrator did at the end of this pass.'
     )
     blendedMessage: Message | None = None
+
+
+class DriverProbeRequest(BaseModel):
+    """
+    Request body for `POST /v1/admin/drivers/probe`. Tests a single
+    backend URL without persisting it. A driver slot may hold
+    several URLs (`DriverEntry.urls`); the UI probes each one
+    separately so an operator can verify every fallback before
+    saving.
+
+    """
+
+    url: AnyUrl = Field(..., description='The single backend base URL to test-connect.')
+    name: str | None = Field(
+        None,
+        description='Optional slot label, echoed into diagnostics. Not required\nto probe; the operator may be testing a URL before naming\nthe slot.\n',
+    )
 
 
 class DriverHealth(BaseModel):

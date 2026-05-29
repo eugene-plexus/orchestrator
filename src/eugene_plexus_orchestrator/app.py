@@ -17,7 +17,7 @@ from .bicameral.callosum import JaccardAgreementScorer, load_default_scorer
 from .bicameral.nt import neutral_state
 from .config import ConfigStore
 from .dependencies import require_authorized, require_operator
-from .hemisphere_client import HemisphereClient, HttpHemisphereClient
+from .hemisphere_client import FailoverHemisphereClient, HemisphereClient, HttpHemisphereClient
 from .identity import HttpIdentity, IdentityClient
 from .memory import HttpMemory, MemoryClient
 from .routes import admin as admin_routes
@@ -46,17 +46,23 @@ def build_clients(store: ConfigStore, auth_state: AuthState) -> list[HemisphereC
     for entry in raw:
         # Validation in ConfigStore.apply_patch already enforces shape, but
         # in-memory config can also be loaded straight from YAML so guard
-        # again here.
+        # again here. `load()` migrates legacy single-`url` entries to the
+        # `urls` list shape, so by here every slot carries `urls`.
         name = entry["name"]
-        url = entry["url"]
-        clients.append(
+        urls = entry["urls"]
+        candidates: list[HemisphereClient] = [
             HttpHemisphereClient(
                 name=name,
                 base_url=url,
                 timeout_seconds=timeout,
                 service_token=auth_state.service_token,
             )
-        )
+            for url in urls
+        ]
+        # One slot = an ordered priority list of backends. A single-URL
+        # slot still goes through FailoverHemisphereClient (one candidate),
+        # which behaves identically to a bare HttpHemisphereClient.
+        clients.append(FailoverHemisphereClient(name=name, candidates=candidates))
     return clients
 
 

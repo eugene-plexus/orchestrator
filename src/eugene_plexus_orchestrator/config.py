@@ -39,11 +39,11 @@ CATEGORY_LABELS: dict[str, str] = {
 }
 
 # Default driver topology: the canonical bicameral pair on local ports.
-# Operators rename / re-URL these via PATCH /v1/config; v0.2+ adds N drivers
-# with backup semantics on top of the same shape.
-DEFAULT_DRIVERS: list[dict[str, str]] = [
-    {"name": "left", "url": "http://127.0.0.1:8081"},
-    {"name": "right", "url": "http://127.0.0.1:8082"},
+# Operators rename / re-URL these via PATCH /v1/config. Each slot's `urls`
+# is a priority list (v0.2.1 failover); stock installs run one URL per slot.
+DEFAULT_DRIVERS: list[dict[str, Any]] = [
+    {"name": "left", "urls": ["http://127.0.0.1:8081"]},
+    {"name": "right", "urls": ["http://127.0.0.1:8082"]},
 ]
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -97,15 +97,19 @@ FIELDS: list[ConfigField] = [
         key="drivers",
         label="Drivers",
         description=(
-            'The list of LLM drivers ("hemispheres") the orchestrator '
-            "talks to on every chat turn. Each entry has a `name` "
+            'The two LLM driver slots ("hemispheres") the orchestrator '
+            "talks to on every chat turn. Each slot has a `name` "
             '(free-form label, e.g. "left" / "right" / "claude" / '
             '"local-llama" — appears on the UI\'s tabs and beside that '
-            "driver's outputs) and a `url` picked from the watchdog "
-            "topology dropdown. v0.1's bicameral loop requires exactly "
-            "two entries; v0.2+ will generalize to N with backup/"
-            "failover. Use the per-row `Test` button to verify a URL "
-            "is reachable before saving."
+            "slot's outputs) and `urls`: an ordered priority list of "
+            "interchangeable backend URLs picked from the watchdog "
+            "topology. On each turn the orchestrator tries the first "
+            "URL; on a transport error / 5xx / timeout it cascades to "
+            "the next (a 4xx fails the slot without cascading, since "
+            "the next backend would hit the same request/auth bug). "
+            "The bicameral loop requires exactly two slots; stock "
+            "installs run one URL per slot. Use the per-URL `Test` "
+            "button to verify each backend is reachable before saving."
         ),
         category="topology",
         valueType=ConfigValueType.driver_list,
@@ -389,6 +393,32 @@ FIELDS: list[ConfigField] = [
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 
+def _migrate_drivers(value: Any) -> Any:
+    """Upgrade legacy single-`url` driver entries to the `urls` list shape.
+
+    Pre-v0.2.1 the `drivers` config stored `{name, url}` per slot. v0.2.1
+    made each slot a priority list (`{name, urls: [...]}`) for failover.
+    On-disk YAML written by an older orchestrator still carries `url`;
+    rewrite `{name, url}` → `{name, urls: [url]}` on load so existing
+    installs keep working without a manual edit. A `url` is only folded in
+    when `urls` is absent, so a config that already has `urls` is left
+    untouched (and an entry carrying both keeps `urls` and drops the stale
+    `url`). Non-list / malformed values pass through unchanged for the
+    validator to reject.
+    """
+    if not isinstance(value, list):
+        return value
+    migrated: list[Any] = []
+    for entry in value:
+        if isinstance(entry, dict) and "urls" not in entry and "url" in entry:
+            upgraded = {k: v for k, v in entry.items() if k != "url"}
+            upgraded["urls"] = [entry["url"]]
+            migrated.append(upgraded)
+        else:
+            migrated.append(entry)
+    return migrated
+
+
 def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
     """Emit the orchestrator config schema.
 
@@ -489,11 +519,14 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
             if not isinstance(entry, dict):
                 return f"entry {i}: expected object, got {type(entry).__name__}"
             name = entry.get("name")
-            url = entry.get("url")
+            urls = entry.get("urls")
             if not isinstance(name, str) or not name.strip():
                 return f"entry {i}: `name` must be a non-empty string"
-            if not isinstance(url, str) or not url.strip():
-                return f"entry {i}: `url` must be a non-empty string"
+            if not isinstance(urls, list) or not urls:
+                return f"entry {i}: `urls` must be a non-empty list of URLs"
+            for j, url in enumerate(urls):
+                if not isinstance(url, str) or not url.strip():
+                    return f"entry {i}: `urls[{j}]` must be a non-empty string"
             if name in seen_names:
                 return f"entry {i}: duplicate driver name {name!r}"
             seen_names.add(name)
@@ -520,7 +553,7 @@ class ConfigStore:
                 merged = _defaults()
                 for k, v in raw.items():
                     if k in _FIELDS_BY_KEY:
-                        merged[k] = v
+                        merged[k] = _migrate_drivers(v) if k == "drivers" else v
                 self._values = merged
             else:
                 self._values = _defaults()
@@ -550,6 +583,13 @@ class ConfigStore:
                 if field is None:
                     rejected.append(ConfigFieldError(key=key, message="unknown field"))
                     continue
+
+                # Accept legacy single-`url` driver entries from older
+                # clients / scripts and upgrade them to the `urls` list
+                # before validation — same normalization the disk-load
+                # path applies (see _migrate_drivers).
+                if key == "drivers":
+                    new_value = _migrate_drivers(new_value)
 
                 err = _validate_value(field, new_value)
                 if err is not None:

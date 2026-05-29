@@ -9,6 +9,7 @@ onto every emitted message and the admin endpoint can label it.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 
 import httpx
@@ -20,6 +21,8 @@ from ._generated.hemisphere_models import (
     GenerateResponse,
     Problem,
 )
+
+log = logging.getLogger(__name__)
 
 
 class HemisphereDriverError(Exception):
@@ -143,3 +146,126 @@ class HttpHemisphereClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+def _is_cascade_eligible(exc: Exception) -> bool:
+    """Failure taxonomy for priority-list failover (v0.2.1).
+
+    Cascade-eligible (try the next backend in the slot):
+      * transport-level errors — connection refused, DNS, read/connect
+        timeout (every `httpx.HTTPError` that isn't a clean response)
+      * upstream 5xx — the backend is reachable but broken/overloaded
+
+    NOT cascade-eligible (fail the slot HARD, re-raise immediately):
+      * upstream 4xx — a request / auth / config bug. The next backend
+        would hit the same bad request, and cascading past it would
+        mask the real problem (e.g. an expired service token reading as
+        "all backends down" instead of "fix your token").
+
+    Locked taxonomy per the v0.2.1 plan: 5xx / transport / timeout
+    cascade; 4xx hard-fails. Timeouts surface as `httpx.TimeoutException`
+    (an `httpx.HTTPError`), so they fall into the transport branch.
+    """
+    if isinstance(exc, HemisphereDriverError):
+        return exc.status_code >= 500
+    return isinstance(exc, httpx.HTTPError)
+
+
+class FailoverHemisphereClient:
+    """A driver *slot* backed by an ordered priority list of backends.
+
+    Implements the same `HemisphereClient` protocol as
+    `HttpHemisphereClient`, so the bicameral loop is oblivious to
+    failover — it still sees exactly two slots and calls `.generate()`
+    on each. Internally this slot tries its candidate backends in order,
+    cascading to the next on a cascade-eligible failure (transport / 5xx
+    / timeout) and failing hard on a 4xx. See `_is_cascade_eligible`.
+
+    Granularity is per-turn-attempt, not per-pass: each `.generate()`
+    call independently walks the priority list from the top. A slot that
+    fell over to its backup on one pass will retry the primary on the
+    next — cheap, and it means a transiently-down primary recovers
+    without operator intervention.
+
+    A single-URL slot (the stock install) constructs one candidate and
+    behaves identically to the pre-v0.2.1 `HttpHemisphereClient`: the
+    loop runs once and the sole backend's error propagates unchanged.
+    """
+
+    def __init__(self, *, name: str, candidates: list[HemisphereClient]) -> None:
+        if not candidates:
+            raise ValueError(f"driver slot {name!r} needs at least one backend URL")
+        self.name = name
+        self._candidates = candidates
+        # `base_url` is the primary backend — used for labelling / logs.
+        # The active backend on a given turn may differ after failover,
+        # but the slot's identity is its primary.
+        self.base_url = candidates[0].base_url
+
+    async def info(self) -> DriverInfo:
+        """Report the first reachable backend's `/v1/info`.
+
+        Mirrors generate()'s failover so the admin drivers listing
+        reflects what a real chat turn would actually reach.
+        """
+        last_exc: Exception | None = None
+        for index, candidate in enumerate(self._candidates):
+            try:
+                return await candidate.info()
+            except Exception as exc:
+                if not _is_cascade_eligible(exc):
+                    raise
+                last_exc = exc
+                self._log_cascade("info", index, candidate, exc)
+        assert last_exc is not None  # candidates is non-empty (checked in __init__)
+        raise last_exc
+
+    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        last_exc: Exception | None = None
+        for index, candidate in enumerate(self._candidates):
+            try:
+                return await candidate.generate(request)
+            except Exception as exc:
+                if not _is_cascade_eligible(exc):
+                    # 4xx / non-HTTP error — surface it without trying the
+                    # next backend. A 4xx is the same bad request everywhere.
+                    raise
+                last_exc = exc
+                self._log_cascade("generate", index, candidate, exc)
+        # Every backend failed in a cascade-eligible way. Re-raise the
+        # last failure so the chat route's existing HemisphereDriverError
+        # / httpx.HTTPError handlers surface it as they would for a
+        # single-backend slot — no new error path to maintain.
+        assert last_exc is not None  # candidates is non-empty (checked in __init__)
+        raise last_exc
+
+    def _log_cascade(
+        self, op: str, index: int, candidate: HemisphereClient, exc: Exception
+    ) -> None:
+        """Emit a WARNING when a backend fails and we cascade.
+
+        Failover that silently always-works hides a broken primary
+        (v0.3-plan risk). This WARNING is the "failover happened"
+        surface operators grep for; the UI failover badge reads the
+        same signal in a later release.
+        """
+        is_last = index == len(self._candidates) - 1
+        next_action = (
+            "no more backends in slot — failing"
+            if is_last
+            else f"trying backend {index + 2}/{len(self._candidates)}"
+        )
+        log.warning(
+            "failover[%s]: slot %r backend %d/%d (%s) failed (%s); %s",
+            op,
+            self.name,
+            index + 1,
+            len(self._candidates),
+            candidate.base_url,
+            exc,
+            next_action,
+        )
+
+    async def aclose(self) -> None:
+        for candidate in self._candidates:
+            await candidate.aclose()

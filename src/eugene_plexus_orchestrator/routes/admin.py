@@ -11,8 +11,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from .._generated.models import (
     BackendKind,
-    DriverEntry,
     DriverHealth,
+    DriverProbeRequest,
     DriversInfo,
     NTState,
     Problem,
@@ -95,18 +95,21 @@ async def list_drivers(request: Request) -> DriversInfo:
 
 
 @router.post("/v1/admin/drivers/probe", response_model=DriverHealth)
-async def probe_driver(request: Request, body: DriverEntry) -> DriverHealth:
-    """Test-connect to an arbitrary driver URL without persisting it.
+async def probe_driver(request: Request, body: DriverProbeRequest) -> DriverHealth:
+    """Test-connect to a single backend URL without persisting it.
 
-    Backs the UI's per-row Test button in the drivers list editor —
-    operators verify a URL is reachable before saving the topology.
-    Builds a one-shot HTTP client, hits the URL's `/v1/info`, and
-    returns the same `DriverHealth` shape the list endpoint uses.
+    Backs the UI's per-URL Test button in the drivers list editor —
+    operators verify each backend in a slot's priority list is
+    reachable before saving the topology. Builds a one-shot HTTP
+    client, hits the URL's `/v1/info`, and returns the same
+    `DriverHealth` shape the list endpoint uses.
     """
     url = str(body.url).rstrip("/")
     service_token = request.app.state.auth_state.service_token
     client = HttpHemisphereClient(
-        name=body.name,
+        # `name` is optional on a probe (the operator may be testing a
+        # URL before naming the slot); fall back to a diagnostic label.
+        name=body.name or "(probe)",
         base_url=url,
         timeout_seconds=_PROBE_TIMEOUT_SECONDS,
         service_token=service_token,

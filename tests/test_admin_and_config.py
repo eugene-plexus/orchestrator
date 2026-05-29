@@ -70,7 +70,7 @@ def test_admin_drivers_probe_rejects_invalid_url(client: TestClient) -> None:
         "/v1/admin/drivers/probe",
         json={"name": "bad", "url": "not-a-url"},
     )
-    # DriverEntry.url is `format: uri` -> 422 from Pydantic before reaching the route.
+    # DriverProbeRequest.url is `format: uri` -> 422 from Pydantic before reaching the route.
     assert response.status_code == 422
 
 
@@ -185,12 +185,13 @@ def test_config_get_then_patch_round_trip(client: TestClient) -> None:
 
 
 def test_config_patch_drivers_validates_shape(client: TestClient) -> None:
+    """Canonical v0.2.1 shape: each slot carries a `urls` priority list."""
     response = client.patch(
         "/v1/config",
         json={
             "drivers": [
-                {"name": "primary", "url": "http://10.0.0.1:8081"},
-                {"name": "secondary", "url": "http://10.0.0.2:8081"},
+                {"name": "primary", "urls": ["http://10.0.0.1:8081", "http://10.0.0.9:8081"]},
+                {"name": "secondary", "urls": ["http://10.0.0.2:8081"]},
             ]
         },
     )
@@ -201,6 +202,30 @@ def test_config_patch_drivers_validates_shape(client: TestClient) -> None:
 
     follow = client.get("/v1/config").json()
     assert [d["name"] for d in follow["drivers"]] == ["primary", "secondary"]
+    # The priority list (including the fallback URL) round-trips intact.
+    assert follow["drivers"][0]["urls"] == ["http://10.0.0.1:8081", "http://10.0.0.9:8081"]
+    assert follow["drivers"][1]["urls"] == ["http://10.0.0.2:8081"]
+
+
+def test_config_patch_drivers_migrates_legacy_url(client: TestClient) -> None:
+    """A PATCH using the pre-v0.2.1 single-`url` shape is accepted and
+    upgraded to the `urls` list, so older scripts keep working."""
+    response = client.patch(
+        "/v1/config",
+        json={
+            "drivers": [
+                {"name": "left", "url": "http://10.0.0.1:8081"},
+                {"name": "right", "url": "http://10.0.0.2:8081"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert "drivers" in response.json()["applied"]
+
+    follow = client.get("/v1/config").json()
+    assert follow["drivers"][0]["urls"] == ["http://10.0.0.1:8081"]
+    assert "url" not in follow["drivers"][0]
+    assert follow["drivers"][1]["urls"] == ["http://10.0.0.2:8081"]
 
 
 def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
@@ -208,8 +233,8 @@ def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
         "/v1/config",
         json={
             "drivers": [
-                {"name": "ok", "url": "http://1.1.1.1"},
-                {"name": "", "url": "http://2.2.2.2"},  # empty name
+                {"name": "ok", "urls": ["http://1.1.1.1"]},
+                {"name": "", "urls": ["http://2.2.2.2"]},  # empty name
             ]
         },
     )
@@ -219,13 +244,26 @@ def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
     assert "name" in rejected["drivers"]
 
 
+def test_config_patch_drivers_rejects_empty_urls(client: TestClient) -> None:
+    """A slot with no backend URLs is rejected — a priority list must
+    have at least one entry to be reachable."""
+    response = client.patch(
+        "/v1/config",
+        json={"drivers": [{"name": "left", "urls": []}]},
+    )
+    assert response.status_code == 200
+    rejected = {r["key"]: r["message"] for r in response.json()["rejected"]}
+    assert "drivers" in rejected
+    assert "urls" in rejected["drivers"]
+
+
 def test_config_patch_drivers_rejects_duplicate_names(client: TestClient) -> None:
     response = client.patch(
         "/v1/config",
         json={
             "drivers": [
-                {"name": "twin", "url": "http://1.1.1.1"},
-                {"name": "twin", "url": "http://2.2.2.2"},
+                {"name": "twin", "urls": ["http://1.1.1.1"]},
+                {"name": "twin", "urls": ["http://2.2.2.2"]},
             ]
         },
     )
