@@ -107,16 +107,21 @@ class DriverEntry(BaseModel):
     themselves are anonymous and report only their backend / model
     identity. The bicameral loop requires exactly two slots.
 
-    A slot is a **priority list** of backend URLs (`urls`), not a
-    single backend (v0.2.1). On each chat turn the orchestrator
-    tries `urls[0]`; if it fails in a cascade-eligible way
-    (transport error / 5xx / timeout) it falls through to
-    `urls[1]`, and so on. A 4xx fails the slot HARD without
-    cascading — a 4xx is a request/auth/config bug that the next
-    backend would hit identically, and cascading past it would
-    mask the real problem. Stock installs run one URL per slot, so
-    the list is length-1 and behaves exactly as the pre-v0.2.1
-    single-`url` shape did.
+    A slot is a **priority list** of backends (`backends`), not a
+    single backend. Each entry is the NAME of a hemisphere-driver
+    entry in the watchdog topology (`GET /v1/components`,
+    `kind: hemisphere-driver`); the orchestrator resolves names to
+    URLs at startup. This keeps backend URLs in exactly one place
+    (the watchdog topology) instead of duplicating them into the
+    orchestrator's config (v0.2.1).
+
+    On each chat turn the orchestrator tries `backends[0]`; if it
+    fails in a cascade-eligible way (transport error / 5xx /
+    timeout) it falls through to `backends[1]`, and so on. A 4xx
+    fails the slot HARD without cascading — a 4xx is a
+    request/auth/config bug that the next backend would hit
+    identically, and cascading past it would mask the real problem.
+    Stock installs run one backend per slot.
 
     """
 
@@ -125,9 +130,10 @@ class DriverEntry(BaseModel):
         description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this slot\nproduces and surfaced in the UI as the tab/column label.\n',
         min_length=1,
     )
-    urls: list[AnyUrl] = Field(
+    backends: list[str] = Field(
         ...,
-        description='Ordered priority list of base URLs where interchangeable\nbackends for this slot are reachable. The orchestrator\ntries them in order on each turn and cascades to the next\non transport error / 5xx / timeout (but not on 4xx). At\nleast one entry is required.\n',
+        description='Ordered priority list of watchdog-topology hemisphere-driver\nentry NAMES that back this slot. The orchestrator resolves\neach name to a URL via `GET /v1/components` at startup and\ntries them in order on each turn, cascading to the next on\ntransport error / 5xx / timeout (but not on 4xx). At least\none entry is required. (Not a URL — a topology entry name.)\n',
+        min_length=1,
     )
 
 
@@ -865,9 +871,9 @@ class DriverProbeRequest(BaseModel):
     """
     Request body for `POST /v1/admin/drivers/probe`. Tests a single
     backend URL without persisting it. A driver slot may hold
-    several URLs (`DriverEntry.urls`); the UI probes each one
-    separately so an operator can verify every fallback before
-    saving.
+    several backends (`DriverEntry.backends`, topology entry names);
+    the UI resolves each to a URL and probes them separately so an
+    operator can verify every fallback before saving.
 
     """
 

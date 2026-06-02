@@ -70,11 +70,21 @@ async def test_config(
     def get(key: str) -> Any:
         return overrides[key] if key in overrides else store.get(key)
 
+    # Resolve slot backends (topology names) → URLs the same way the
+    # lifespan does, so the Test button probes the real endpoints a chat
+    # turn would reach. Lazy import breaks the app↔routes import cycle.
+    from ..app import _resolve_backend_url, driver_topology, fetch_components
+
     drivers_raw = get("drivers") or []
     memory_url = str(get("memoryUrl") or "")
     timeout = float(get("requestTimeoutSeconds") or 30)
+    settings = request.app.state.settings
     service_token = request.app.state.auth_state.service_token
     probe_headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
+
+    topo = driver_topology(
+        await fetch_components(watchdog_url=settings.watchdog_url, service_token=service_token)
+    )
 
     async def probe(name: str, base_url: str, path: str) -> tuple[str, str | None]:
         """Returns (target-name, error-or-None)."""
@@ -89,24 +99,35 @@ async def test_config(
         return name, None
 
     probes: list[Any] = [probe("memory", memory_url, "/healthz")]
+    # Backends that don't resolve to a URL are immediate failures (no
+    # endpoint to probe); collected here and merged with the probe results.
+    immediate: list[tuple[str, str | None]] = []
     for entry in drivers_raw:
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or "<unnamed>")
-        # A slot is a priority list of backends (v0.2.1). Probe each URL
-        # so a misconfigured fallback is caught before it's ever needed.
-        # Tolerate the legacy single-`url` shape in case an override
-        # payload predates the migration. Label multi-backend slots
-        # `name[0]`, `name[1]`, … so the operator can tell them apart.
-        urls = entry.get("urls")
-        if not isinstance(urls, list) or not urls:
-            legacy = entry.get("url")
-            urls = [legacy] if legacy else []
-        for i, url in enumerate(urls):
-            label = name if len(urls) == 1 else f"{name}[{i}]"
-            probes.append(probe(label, str(url or ""), "/v1/info"))
+        # A slot is a priority list of backend NAMES (v0.2.1). Resolve and
+        # probe each so a misconfigured fallback is caught before it's
+        # needed. Tolerate legacy `urls`/`url` overrides that predate the
+        # migration. Label multi-backend slots `name[0]`, `name[1]`, ….
+        backends = entry.get("backends")
+        if not isinstance(backends, list) or not backends:
+            legacy = entry.get("urls")
+            if not isinstance(legacy, list) or not legacy:
+                single = entry.get("url")
+                legacy = [single] if single else []
+            backends = legacy
+        for i, backend in enumerate(backends):
+            label = name if len(backends) == 1 else f"{name}[{i}]"
+            url = _resolve_backend_url(str(backend), topo)
+            if url is None:
+                immediate.append(
+                    (label, f"{label}: backend {backend!r} not found in watchdog topology")
+                )
+            else:
+                probes.append(probe(label, url, "/v1/info"))
 
-    results = await asyncio.gather(*probes)
+    results = list(await asyncio.gather(*probes)) + immediate
 
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     failures = [err for _, err in results if err]

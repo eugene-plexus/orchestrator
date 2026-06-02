@@ -394,6 +394,30 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     drivers: list[HemisphereClient] = request.app.state.drivers
     identity: IdentityClient | None = getattr(request.app.state, "identity", None)
 
+    # The bicameral loop needs exactly two driver slots. Since v0.2.1
+    # item 2 slots resolve their backends against the watchdog topology
+    # at startup, a topology that was unreachable (or missing the named
+    # drivers) leaves fewer than two slots built. Surface that as a clean
+    # 503 — the degraded-mode contract — rather than letting per-driver
+    # prompt assembly raise an uncaught 500 deeper in the turn.
+    if len(drivers) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/orchestrator#drivers-unavailable",
+                title="Drivers not available",
+                status=503,
+                detail=(
+                    f"The bicameral loop needs two driver slots; {len(drivers)} "
+                    "resolved. Check that the `drivers` config names hemisphere-"
+                    "driver entries present in the watchdog topology (GET "
+                    "/v1/components) and that the watchdog is reachable, then "
+                    "restart."
+                ),
+                component="orchestrator",
+            ).model_dump(exclude_none=True),
+        )
+
     # Resolve speaker before any memory writes so we can stamp every
     # MemoryEntry with the right personId. body.personId wins; otherwise
     # fall back to the operator's personId from identity. UI chat calls

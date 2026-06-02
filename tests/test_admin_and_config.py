@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.conftest import FakeHemisphereClient
@@ -185,13 +186,14 @@ def test_config_get_then_patch_round_trip(client: TestClient) -> None:
 
 
 def test_config_patch_drivers_validates_shape(client: TestClient) -> None:
-    """Canonical v0.2.1 shape: each slot carries a `urls` priority list."""
+    """Canonical v0.2.1-item-2 shape: each slot carries a `backends`
+    priority list of watchdog-topology entry names."""
     response = client.patch(
         "/v1/config",
         json={
             "drivers": [
-                {"name": "primary", "urls": ["http://10.0.0.1:8081", "http://10.0.0.9:8081"]},
-                {"name": "secondary", "urls": ["http://10.0.0.2:8081"]},
+                {"name": "left", "backends": ["claude-local", "claude-openrouter"]},
+                {"name": "right", "backends": ["gpt-local"]},
             ]
         },
     )
@@ -201,21 +203,22 @@ def test_config_patch_drivers_validates_shape(client: TestClient) -> None:
     assert body["requiresRestart"] is True
 
     follow = client.get("/v1/config").json()
-    assert [d["name"] for d in follow["drivers"]] == ["primary", "secondary"]
-    # The priority list (including the fallback URL) round-trips intact.
-    assert follow["drivers"][0]["urls"] == ["http://10.0.0.1:8081", "http://10.0.0.9:8081"]
-    assert follow["drivers"][1]["urls"] == ["http://10.0.0.2:8081"]
+    assert [d["name"] for d in follow["drivers"]] == ["left", "right"]
+    # The priority list (including the fallback name) round-trips intact.
+    assert follow["drivers"][0]["backends"] == ["claude-local", "claude-openrouter"]
+    assert follow["drivers"][1]["backends"] == ["gpt-local"]
 
 
-def test_config_patch_drivers_migrates_legacy_url(client: TestClient) -> None:
-    """A PATCH using the pre-v0.2.1 single-`url` shape is accepted and
-    upgraded to the `urls` list, so older scripts keep working."""
+def test_config_patch_drivers_migrates_legacy_urls(client: TestClient) -> None:
+    """A PATCH using the v0.2.1-item-1 `urls` shape is accepted and
+    renamed to `backends` (values preserved as URL-shaped backends),
+    so configs written between item 1 and item 2 keep working."""
     response = client.patch(
         "/v1/config",
         json={
             "drivers": [
-                {"name": "left", "url": "http://10.0.0.1:8081"},
-                {"name": "right", "url": "http://10.0.0.2:8081"},
+                {"name": "left", "urls": ["http://10.0.0.1:8081", "http://10.0.0.9:8081"]},
+                {"name": "right", "urls": ["http://10.0.0.2:8081"]},
             ]
         },
     )
@@ -223,9 +226,21 @@ def test_config_patch_drivers_migrates_legacy_url(client: TestClient) -> None:
     assert "drivers" in response.json()["applied"]
 
     follow = client.get("/v1/config").json()
-    assert follow["drivers"][0]["urls"] == ["http://10.0.0.1:8081"]
+    assert follow["drivers"][0]["backends"] == ["http://10.0.0.1:8081", "http://10.0.0.9:8081"]
+    assert "urls" not in follow["drivers"][0]
+    assert follow["drivers"][1]["backends"] == ["http://10.0.0.2:8081"]
+
+
+def test_config_patch_drivers_migrates_oldest_url(client: TestClient) -> None:
+    """The pre-v0.2.1 single-`url` shape upgrades straight to `backends`."""
+    response = client.patch(
+        "/v1/config",
+        json={"drivers": [{"name": "left", "url": "http://10.0.0.1:8081"}]},
+    )
+    assert response.status_code == 200
+    follow = client.get("/v1/config").json()
+    assert follow["drivers"][0]["backends"] == ["http://10.0.0.1:8081"]
     assert "url" not in follow["drivers"][0]
-    assert follow["drivers"][1]["urls"] == ["http://10.0.0.2:8081"]
 
 
 def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
@@ -233,8 +248,8 @@ def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
         "/v1/config",
         json={
             "drivers": [
-                {"name": "ok", "urls": ["http://1.1.1.1"]},
-                {"name": "", "urls": ["http://2.2.2.2"]},  # empty name
+                {"name": "ok", "backends": ["left"]},
+                {"name": "", "backends": ["right"]},  # empty name
             ]
         },
     )
@@ -244,17 +259,17 @@ def test_config_patch_drivers_rejects_malformed(client: TestClient) -> None:
     assert "name" in rejected["drivers"]
 
 
-def test_config_patch_drivers_rejects_empty_urls(client: TestClient) -> None:
-    """A slot with no backend URLs is rejected — a priority list must
-    have at least one entry to be reachable."""
+def test_config_patch_drivers_rejects_empty_backends(client: TestClient) -> None:
+    """A slot with no backends is rejected — a priority list must have at
+    least one entry to be reachable."""
     response = client.patch(
         "/v1/config",
-        json={"drivers": [{"name": "left", "urls": []}]},
+        json={"drivers": [{"name": "left", "backends": []}]},
     )
     assert response.status_code == 200
     rejected = {r["key"]: r["message"] for r in response.json()["rejected"]}
     assert "drivers" in rejected
-    assert "urls" in rejected["drivers"]
+    assert "backends" in rejected["drivers"]
 
 
 def test_config_patch_drivers_rejects_duplicate_names(client: TestClient) -> None:
@@ -262,11 +277,55 @@ def test_config_patch_drivers_rejects_duplicate_names(client: TestClient) -> Non
         "/v1/config",
         json={
             "drivers": [
-                {"name": "twin", "urls": ["http://1.1.1.1"]},
-                {"name": "twin", "urls": ["http://2.2.2.2"]},
+                {"name": "twin", "backends": ["a"]},
+                {"name": "twin", "backends": ["b"]},
             ]
         },
     )
     assert response.status_code == 200
     rejected = {r["key"]: r["message"] for r in response.json()["rejected"]}
     assert "duplicate" in rejected["drivers"].lower()
+
+
+def test_config_schema_voicedriver_is_strict_enum(client: TestClient) -> None:
+    """voiceDriver renders as a strict enum of the configured slot names
+    (plus a leading '(first driver)' default) — but validation stays
+    lenient (see test below)."""
+    client.patch(
+        "/v1/config",
+        json={
+            "drivers": [
+                {"name": "left", "backends": ["a"]},
+                {"name": "right", "backends": ["b"]},
+            ]
+        },
+    )
+    schema = client.get("/v1/config/schema").json()
+    vd = next(f for f in schema["fields"] if f["key"] == "voiceDriver")
+    assert vd["valueType"] == "enum"
+    assert vd["enumValues"] == ["", "left", "right"]
+    assert vd["enumLabels"][0] == "(first driver)"
+
+
+def test_config_patch_voicedriver_stays_lenient(client: TestClient) -> None:
+    """Despite the strict enum schema, validation accepts an unknown
+    voiceDriver name — the chat handler falls back to the first driver,
+    so we never hard-reject a name the operator is about to create."""
+    response = client.patch("/v1/config", json={"voiceDriver": "not-a-slot"})
+    assert response.status_code == 200
+    assert "voiceDriver" in response.json()["applied"]
+    assert client.get("/v1/config").json()["voiceDriver"] == "not-a-slot"
+
+
+def test_chat_503_when_fewer_than_two_drivers(
+    app: FastAPI, left_fake: FakeHemisphereClient
+) -> None:
+    """v0.2.1 item 2: slot backends resolve against the watchdog topology
+    at startup. If the topology was unreachable / missing the named
+    drivers, fewer than two slots get built — chat must 503 cleanly
+    rather than 500 deep in per-driver prompt assembly."""
+    app.state.drivers = [left_fake]  # only one slot resolved
+    with TestClient(app) as c:
+        response = c.post("/v1/chat", json={"message": "hi"})
+    assert response.status_code == 503
+    assert "driver" in response.json()["detail"]["detail"].lower()

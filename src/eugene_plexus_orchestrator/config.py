@@ -38,12 +38,14 @@ CATEGORY_LABELS: dict[str, str] = {
     "persona": "Persona",
 }
 
-# Default driver topology: the canonical bicameral pair on local ports.
-# Operators rename / re-URL these via PATCH /v1/config. Each slot's `urls`
-# is a priority list (v0.2.1 failover); stock installs run one URL per slot.
+# Default driver topology: the canonical bicameral pair. Each slot's
+# `backends` is a priority list of watchdog-topology hemisphere-driver
+# entry NAMES (v0.2.1) — the orchestrator resolves them to URLs at
+# startup. The default names match the stock wizard's "left"/"right"
+# topology entries; operators rename / re-point via PATCH /v1/config.
 DEFAULT_DRIVERS: list[dict[str, Any]] = [
-    {"name": "left", "urls": ["http://127.0.0.1:8081"]},
-    {"name": "right", "urls": ["http://127.0.0.1:8082"]},
+    {"name": "left", "backends": ["left"]},
+    {"name": "right", "backends": ["right"]},
 ]
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -101,26 +103,29 @@ FIELDS: list[ConfigField] = [
             "talks to on every chat turn. Each slot has a `name` "
             '(free-form label, e.g. "left" / "right" / "claude" / '
             '"local-llama" — appears on the UI\'s tabs and beside that '
-            "slot's outputs) and `urls`: an ordered priority list of "
-            "interchangeable backend URLs picked from the watchdog "
-            "topology. On each turn the orchestrator tries the first "
-            "URL; on a transport error / 5xx / timeout it cascades to "
-            "the next (a 4xx fails the slot without cascading, since "
-            "the next backend would hit the same request/auth bug). "
-            "The bicameral loop requires exactly two slots; stock "
-            "installs run one URL per slot. Use the per-URL `Test` "
-            "button to verify each backend is reachable before saving."
+            "slot's outputs) and `backends`: an ordered priority list of "
+            "watchdog-topology hemisphere-driver entry NAMES. The "
+            "orchestrator resolves each name to a URL via the watchdog "
+            "topology at startup, so backend URLs live in exactly one "
+            "place (watchdog.yaml) instead of being duplicated here. On "
+            "each turn it tries the first backend; on a transport error "
+            "/ 5xx / timeout it cascades to the next (a 4xx fails the "
+            "slot without cascading, since the next backend would hit "
+            "the same request/auth bug). The bicameral loop requires "
+            "exactly two slots; stock installs run one backend per slot. "
+            "Use the per-backend `Test` button to verify each is "
+            "reachable before saving."
         ),
         category="topology",
         valueType=ConfigValueType.driver_list,
-        # Each row's URL points at a watchdog-supervised hemisphere-
-        # driver. UI renders the URL field as a dropdown sourced from
-        # the watchdog topology rather than free-text. The longer-term
-        # design question — whether the orchestrator should maintain
-        # its own drivers list at all vs. just consuming watchdog
-        # topology — is v0.3 work (project_voicedriver_is_a_hack_v03_
-        # rethink memory). The dropdown is a near-term safety net
-        # against hand-typed URL typos.
+        # Each backend names a watchdog-supervised hemisphere-driver
+        # topology entry; the UI renders backends as a dropdown of those
+        # names (sourced via componentKindHint) and the orchestrator
+        # resolves them to URLs at startup. v0.2.1 item 2 removed the
+        # old URL-duplicating design: the orchestrator keeps the slot /
+        # pairing / failover structure (which topology can't express)
+        # but no longer stores backend URLs — those live only in the
+        # watchdog topology.
         componentKindHint=ComponentKind.hemisphere_driver,
         default=DEFAULT_DRIVERS,
         required=True,
@@ -394,25 +399,35 @@ _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 
 def _migrate_drivers(value: Any) -> Any:
-    """Upgrade legacy single-`url` driver entries to the `urls` list shape.
+    """Upgrade legacy driver-slot shapes to the `backends` name list.
 
-    Pre-v0.2.1 the `drivers` config stored `{name, url}` per slot. v0.2.1
-    made each slot a priority list (`{name, urls: [...]}`) for failover.
-    On-disk YAML written by an older orchestrator still carries `url`;
-    rewrite `{name, url}` → `{name, urls: [url]}` on load so existing
-    installs keep working without a manual edit. A `url` is only folded in
-    when `urls` is absent, so a config that already has `urls` is left
-    untouched (and an entry carrying both keeps `urls` and drops the stale
-    `url`). Non-list / malformed values pass through unchanged for the
-    validator to reject.
+    Shape history per slot:
+      * pre-v0.2.1:  `{name, url}`            (single backend URL)
+      * v0.2.1 item1: `{name, urls: [...]}`   (URL priority list)
+      * v0.2.1 item2: `{name, backends: [...]}` (topology-name priority list)
+
+    Rewrite the two legacy shapes to `backends`, preserving the values.
+    Legacy values are URLs, not topology names — they survive here as
+    URL-shaped backend strings and are resolved directly (with a
+    warn-to-re-save) by `build_clients`, so existing installs keep
+    working without a manual edit. `backends` is only synthesized when
+    absent, so a config that already uses it is left untouched (and an
+    entry carrying both keeps `backends`, dropping the stale `urls`/
+    `url`). Non-list / malformed values pass through for the validator.
     """
     if not isinstance(value, list):
         return value
     migrated: list[Any] = []
     for entry in value:
-        if isinstance(entry, dict) and "urls" not in entry and "url" in entry:
+        if isinstance(entry, dict) and "backends" not in entry and "urls" in entry:
+            upgraded = {k: v for k, v in entry.items() if k not in ("urls", "url")}
+            upgraded["backends"] = (
+                list(entry["urls"]) if isinstance(entry["urls"], list) else entry["urls"]
+            )
+            migrated.append(upgraded)
+        elif isinstance(entry, dict) and "backends" not in entry and "url" in entry:
             upgraded = {k: v for k, v in entry.items() if k != "url"}
-            upgraded["urls"] = [entry["url"]]
+            upgraded["backends"] = [entry["url"]]
             migrated.append(upgraded)
         else:
             migrated.append(entry)
@@ -422,16 +437,22 @@ def _migrate_drivers(value: Any) -> Any:
 def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
     """Emit the orchestrator config schema.
 
-    `driver_names` — when supplied — populates the `voiceDriver` field
-    with `suggestions` from the currently-configured driver topology.
-    Voice driver choice is empirically the persona lever (see project
-    memory `voice-driver-choice-is-the-persona-lever-not-hemisphere-choice`),
-    so making this a one-click dropdown instead of free-text-from-memory
-    matters more than the field's surface area implies.
+    `driver_names` — when supplied — turns the `voiceDriver` field into
+    a strict dropdown (dynamic enum) of the currently-configured driver
+    slot names, with a leading "(first driver)" default. Voice driver
+    choice is empirically the persona lever (see project memory
+    `voice-driver-choice-is-the-persona-lever-not-hemisphere-choice`), so
+    a one-click strict dropdown beats the old free-text-with-suggestions.
+
+    Note this only changes the SCHEMA (what the UI renders). The static
+    `FIELDS` entry stays `valueType=string`, so PATCH validation remains
+    lenient — an operator can save a name that isn't a current slot, and
+    `_resolve_voice_driver` falls back to the first driver. The strict
+    dropdown is presentation; the lenient string is the contract.
     """
     if driver_names:
         fields = [
-            _with_voice_driver_suggestions(f, driver_names) if f.key == "voiceDriver" else f
+            _with_voice_driver_enum(f, driver_names) if f.key == "voiceDriver" else f
             for f in FIELDS
         ]
     else:
@@ -443,12 +464,19 @@ def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
     )
 
 
-def _with_voice_driver_suggestions(field: ConfigField, driver_names: list[str]) -> ConfigField:
-    """Return a copy of `voiceDriver` carrying the configured driver
-    names as discovery suggestions. valueType stays `string` so the
-    operator can paste a name that isn't in topology yet (test-time
-    convenience)."""
-    return field.model_copy(update={"suggestions": list(driver_names)})
+def _with_voice_driver_enum(field: ConfigField, driver_names: list[str]) -> ConfigField:
+    """Return a copy of `voiceDriver` rendered as a strict enum dropdown
+    of the configured driver slot names, with a leading empty option
+    labelled "(first driver)" for the unset/default case. The UI's enum
+    renderer keys off `valueType==enum` + `enumValues`, so this needs no
+    UI change."""
+    return field.model_copy(
+        update={
+            "valueType": ConfigValueType.enum,
+            "enumValues": ["", *driver_names],
+            "enumLabels": ["(first driver)", *driver_names],
+        }
+    )
 
 
 def _defaults() -> dict[str, Any]:
@@ -519,14 +547,14 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
             if not isinstance(entry, dict):
                 return f"entry {i}: expected object, got {type(entry).__name__}"
             name = entry.get("name")
-            urls = entry.get("urls")
+            backends = entry.get("backends")
             if not isinstance(name, str) or not name.strip():
                 return f"entry {i}: `name` must be a non-empty string"
-            if not isinstance(urls, list) or not urls:
-                return f"entry {i}: `urls` must be a non-empty list of URLs"
-            for j, url in enumerate(urls):
-                if not isinstance(url, str) or not url.strip():
-                    return f"entry {i}: `urls[{j}]` must be a non-empty string"
+            if not isinstance(backends, list) or not backends:
+                return f"entry {i}: `backends` must be a non-empty list of topology names"
+            for j, backend in enumerate(backends):
+                if not isinstance(backend, str) or not backend.strip():
+                    return f"entry {i}: `backends[{j}]` must be a non-empty string"
             if name in seen_names:
                 return f"entry {i}: duplicate driver name {name!r}"
             seen_names.add(name)

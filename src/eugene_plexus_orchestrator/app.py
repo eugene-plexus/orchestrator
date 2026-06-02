@@ -30,15 +30,50 @@ from .settings import Settings, load_settings
 log = logging.getLogger(__name__)
 
 
-def build_clients(store: ConfigStore, auth_state: AuthState) -> list[HemisphereClient]:
-    """Construct one HemisphereClient per configured driver.
+def _resolve_backend_url(backend: str, topology: dict[str, str]) -> str | None:
+    """Resolve one slot backend (a topology entry name) to a URL.
 
-    Reads the `drivers` config field — a list of {name, url} entries — and
-    builds an `HttpHemisphereClient` for each. Order is preserved so the
-    bicameral loop and admin endpoints walk the drivers in the operator's
-    declared order. Threads `auth_state.service_token` through so each
-    outbound /v1/generate carries the orchestrator's service-audience
-    bearer; the driver validates that against the shared signing key.
+    Resolution order:
+      1. Exact match against a watchdog-topology hemisphere-driver name.
+      2. URL-shaped fallback — a backend that looks like a URL (`http…`)
+         is used directly. This covers configs migrated from the
+         pre-v0.2.1-item-2 `urls` shape, where the stored values are
+         URLs rather than names; the operator should re-save via the UI
+         dropdown to convert them to names (logged below).
+      3. Unresolvable — None (caller skips + warns).
+    """
+    url = topology.get(backend)
+    if url:
+        return url.rstrip("/")
+    if backend.startswith(("http://", "https://")):
+        log.warning(
+            "driver backend %r is a raw URL, not a topology name — using it directly. "
+            "Re-save the drivers config to pick a topology entry instead.",
+            backend,
+        )
+        return backend.rstrip("/")
+    return None
+
+
+def build_clients(
+    store: ConfigStore,
+    auth_state: AuthState,
+    topology: dict[str, str],
+) -> list[HemisphereClient]:
+    """Construct one HemisphereClient per configured driver slot.
+
+    Reads the `drivers` config — `[{name, backends: [topology-name, …]}]`
+    — and resolves each backend NAME to a URL via `topology` (a
+    name→url map of the watchdog's hemisphere-driver entries, fetched
+    once at startup). Order is preserved so the bicameral loop and admin
+    endpoints walk slots and their failover backends in declared order.
+    Threads `auth_state.service_token` through so each outbound
+    /v1/generate carries the orchestrator's service-audience bearer.
+
+    A backend that resolves to no URL (unknown topology name, not
+    URL-shaped) is skipped with a warning. A slot left with zero
+    resolvable backends is not built — running with a partial/empty
+    driver set degrades to a 503 at chat time rather than crashing.
     """
     raw = store.get("drivers") or []
     timeout = float(store.get("requestTimeoutSeconds") or 180)
@@ -46,43 +81,63 @@ def build_clients(store: ConfigStore, auth_state: AuthState) -> list[HemisphereC
     for entry in raw:
         # Validation in ConfigStore.apply_patch already enforces shape, but
         # in-memory config can also be loaded straight from YAML so guard
-        # again here. `load()` migrates legacy single-`url` entries to the
-        # `urls` list shape, so by here every slot carries `urls`.
+        # again here. `load()` migrates legacy `urls`/`url` entries to the
+        # `backends` shape, so by here every slot carries `backends`.
         name = entry["name"]
-        urls = entry["urls"]
-        candidates: list[HemisphereClient] = [
-            HttpHemisphereClient(
-                name=name,
-                base_url=url,
-                timeout_seconds=timeout,
-                service_token=auth_state.service_token,
+        backends = entry["backends"]
+        candidates: list[HemisphereClient] = []
+        for backend in backends:
+            url = _resolve_backend_url(backend, topology)
+            if url is None:
+                log.warning(
+                    "driver slot %r: backend %r not found in watchdog topology "
+                    "(known: %s) — skipping it",
+                    name,
+                    backend,
+                    sorted(topology),
+                )
+                continue
+            candidates.append(
+                HttpHemisphereClient(
+                    name=name,
+                    base_url=url,
+                    timeout_seconds=timeout,
+                    service_token=auth_state.service_token,
+                )
             )
-            for url in urls
-        ]
-        # One slot = an ordered priority list of backends. A single-URL
+        if not candidates:
+            log.warning(
+                "driver slot %r has no resolvable backends %s — not building it",
+                name,
+                backends,
+            )
+            continue
+        # One slot = an ordered priority list of backends. A single-backend
         # slot still goes through FailoverHemisphereClient (one candidate),
         # which behaves identically to a bare HttpHemisphereClient.
         clients.append(FailoverHemisphereClient(name=name, candidates=candidates))
     return clients
 
 
-async def resolve_peer_url(
+async def fetch_components(
     *,
-    kind: str,
     watchdog_url: str,
     service_token: str | None,
     timeout_seconds: float = 5.0,
-) -> str | None:
-    """Ask the watchdog where a peer component lives.
+) -> list[dict[str, Any]]:
+    """Fetch the watchdog topology (`GET /v1/components`), once.
 
     The watchdog is the source of truth for body-component topology;
     duplicating URLs in every component's config is the OpenClaw-style
-    trap we're avoiding. When an operator-supplied URL is missing for
-    a peer (`memoryUrl`, `identityUrl`), the orchestrator calls this
-    to get it directly from `GET /v1/components` filtered by `kind`.
+    trap we're avoiding. The orchestrator resolves its peers (memory,
+    identity) and its driver backends from this one snapshot at startup
+    — item 3 (v0.2.1) made the endpoint accept the orchestrator's
+    service token.
 
-    Returns the peer's URL (with any trailing slash stripped) or None
-    when the watchdog can't be reached / has no entry of that kind.
+    Returns the list of component dicts, or `[]` when the watchdog
+    can't be reached / returns an error. An empty result degrades
+    cleanly: peers stay unresolved and drivers don't build, rather than
+    crashing startup.
     """
     headers = {"Authorization": f"Bearer {service_token}"} if service_token else {}
     try:
@@ -92,19 +147,37 @@ async def resolve_peer_url(
                 headers=headers,
             )
         if response.status_code >= 400:
-            return None
+            return []
         body = response.json()
     except (httpx.HTTPError, ValueError):
-        return None
+        return []
     components = body.get("components") if isinstance(body, dict) else None
-    if not isinstance(components, list):
-        return None
+    return components if isinstance(components, list) else []
+
+
+def peer_url_from(components: list[dict[str, Any]], kind: str) -> str | None:
+    """First topology URL of the given `kind` (trailing slash stripped)."""
     for c in components:
         if isinstance(c, dict) and c.get("kind") == kind:
             url = c.get("url")
             if isinstance(url, str) and url:
                 return url.rstrip("/")
     return None
+
+
+def driver_topology(components: list[dict[str, Any]]) -> dict[str, str]:
+    """Build a {name: url} map of the hemisphere-driver topology entries.
+
+    This is what `build_clients` resolves slot backends against. URLs
+    keep their trailing slash here; `_resolve_backend_url` strips it.
+    """
+    out: dict[str, str] = {}
+    for c in components:
+        if isinstance(c, dict) and c.get("kind") == "hemisphere-driver":
+            name, url = c.get("name"), c.get("url")
+            if isinstance(name, str) and name and isinstance(url, str) and url:
+                out[name] = url
+    return out
 
 
 def build_memory(memory_url: str, auth_state: AuthState) -> tuple[MemoryClient, str]:
@@ -174,23 +247,32 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     auth_state: AuthState = app.state.auth_state
 
-    # Resolve peer URLs. Operator-supplied config wins; otherwise we ask
-    # the watchdog (source of truth for body-component topology) and
-    # auto-resolve. The duplicate-URL trap — where an operator who set
-    # up identity in the wizard nevertheless has identityUrl unset on
-    # the orchestrator and silently runs without identity — is exactly
-    # what this auto-resolve closes.
-    async def _resolve(kind: str, config_key: str) -> str | None:
+    # Fetch the watchdog topology ONCE and resolve everything from it:
+    # peer URLs (memory, identity) and the hemisphere-driver name→url map
+    # that `build_clients` resolves slot backends against. One round-trip
+    # instead of one-per-peer; the source of truth is the watchdog, so
+    # backend URLs aren't duplicated into the orchestrator's own config.
+    components = (
+        []
+        if settings.safe_mode
+        else await fetch_components(
+            watchdog_url=settings.watchdog_url,
+            service_token=auth_state.service_token,
+        )
+    )
+
+    # Resolve peer URLs. Operator-supplied config wins; otherwise we take
+    # it from the topology snapshot. The duplicate-URL trap — where an
+    # operator who set up identity in the wizard nevertheless has
+    # identityUrl unset on the orchestrator and silently runs without
+    # identity — is exactly what this auto-resolve closes.
+    def _resolve(kind: str, config_key: str) -> str | None:
         explicit = str(store.get(config_key) or "").strip()
         if explicit:
             return explicit
         if settings.safe_mode:
             return None
-        resolved = await resolve_peer_url(
-            kind=kind,
-            watchdog_url=settings.watchdog_url,
-            service_token=auth_state.service_token,
-        )
+        resolved = peer_url_from(components, kind)
         if resolved:
             log.info(
                 "auto-resolved %s from watchdog: %s (config field %s was unset)",
@@ -210,7 +292,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.memory_url = ""
             owns_memory = False
         else:
-            memory_url = await _resolve("memory", "memoryUrl") or "http://127.0.0.1:8083"
+            memory_url = _resolve("memory", "memoryUrl") or "http://127.0.0.1:8083"
             memory, memory_url = build_memory(memory_url, auth_state)
             app.state.memory = memory
             app.state.memory_url = memory_url
@@ -229,7 +311,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.identity_url = ""
             owns_identity = False
         else:
-            identity_url = await _resolve("identity", "identityUrl")
+            identity_url = _resolve("identity", "identityUrl")
             if identity_url:
                 identity, identity_url = build_identity(identity_url, auth_state)
                 app.state.identity = identity
@@ -244,9 +326,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.identity_url = getattr(app.state, "identity_url", "")
 
     if not hasattr(app.state, "drivers"):
-        # Defaults have no `drivers` configured; build_clients returns []
-        # in safe mode anyway, but skip the call for clarity.
-        app.state.drivers = [] if settings.safe_mode else build_clients(store, auth_state)
+        # Slot backends are resolved against the hemisphere-driver entries
+        # in the topology snapshot. In safe mode (or when the watchdog is
+        # unreachable) the map is empty → no drivers built → chat 503.
+        app.state.drivers = (
+            []
+            if settings.safe_mode
+            else build_clients(store, auth_state, driver_topology(components))
+        )
         owns_clients = not settings.safe_mode
     else:
         owns_clients = False
