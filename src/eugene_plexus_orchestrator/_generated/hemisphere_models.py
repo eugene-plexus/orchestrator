@@ -12,52 +12,153 @@ from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
 
 class Role(StrEnum):
     """
-    The speaker of a single message in a conversation.
+    The speaker of a single message in a conversation. `tool` carries
+    the result(s) of a tool / region call fed back into deliberation
+    (see ToolResult) — its own kind of utterance, distinct from the
+    `user` who originally spoke.
+
     """
 
     system = 'system'
     user = 'user'
     assistant = 'assistant'
     hemisphere = 'hemisphere'
+    tool = 'tool'
 
 
-class Message(BaseModel):
+class ToolChannel(StrEnum):
     """
-    A single message in an Eugene Plexus conversation. The shape is
-    deliberately close to the OpenAI / Anthropic chat message format so
-    that adapters don't have to re-shape on every hop, but `role` includes
-    `hemisphere` for messages emitted by one of the parallel drivers
-    during a bicameral pass (visible to corpus callosum and UI debug
-    views, not normally to the end user).
+    Direction a tool moves information relative to Eugene — the spine
+    of the perception/action model.
+
+    * `afferent` — brings world-state IN. Senses and reads: web
+      fetch, a connector delivering an inbound message, memory
+      recall, reading a file. Changes nothing in the world.
+    * `efferent` — acts ON the world. Send, write, delete, pay — and
+      notably *speaking to the user* (the Broca / voice-pass
+      effector; the user-facing reply is an efferent tool, not a
+      privileged final output). `effect` is consulted only for this
+      channel.
+    * `internal` — a regimented call to another region rather than
+      the outside world: emotion-read of an inbound message (feeds
+      NT), agreement scoring, summarization, topic-shift detection.
+      No external contact; the result typically updates internal
+      state. Reuses the same envelope so region-to-region cognition
+      threads through the identical `role: tool` machinery.
 
     """
 
-    role: Role
-    content: str = Field(
+    afferent = 'afferent'
+    efferent = 'efferent'
+    internal = 'internal'
+
+
+class ToolEffect(StrEnum):
+    """
+    Reversibility class of an `efferent` tool — drives the
+    System-1/System-2 escalation gate. Ignored for `afferent` /
+    `internal` tools, which commit nothing to the world (treat as
+    `read_only`).
+
+    * `read_only` — no world-effect (a pure read). Reflexive-eligible:
+      a single pre-deliberation stream may fire it without bicameral
+      agreement.
+    * `reversible` — an undoable side effect (compose a draft, write a
+      scratch file). The action taken *pre*-deliberation that produces
+      the artifact deliberation then edits — e.g. banging out an email
+      draft before studying it.
+    * `irreversible` — cannot be undone (send, delete, pay, post
+      publicly). Always *post*-deliberation: requires deliberation
+      plus bicameral agreement before the singular effector executes.
+
+    Reversibility is the static property; whether an action fires pre-
+    or post-deliberation is the runtime routing the gate derives from
+    it plus live NT state (anxiety can escalate even a read into
+    deliberation). Conservative default: anything not provably
+    reversible registers `irreversible`. Promotion is explicit, never
+    inferred.
+
+    """
+
+    read_only = 'read_only'
+    reversible = 'reversible'
+    irreversible = 'irreversible'
+
+
+class ToolDefinition(BaseModel):
+    """
+    A capability Eugene can invoke, normalized across backends. The
+    orchestrator owns the catalog; each hemisphere-driver adapter
+    translates this into its backend's native mechanism (Anthropic
+    tool-use blocks, OpenAI function-calling, or Hermes-style
+    `<tool_call>` text for `openai_compat_http` models without native
+    support).
+
+    """
+
+    name: str = Field(
         ...,
-        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+        description='Stable tool identifier. Echoed in `ToolCall.name`.',
+        pattern='^[a-zA-Z0-9_-]{1,64}$',
     )
-    driverName: str | None = Field(
+    description: str | None = Field(
         None,
-        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+        description='What the tool does, in model-facing language. This is prompt\nmaterial — the model reads it to decide when to call.\n',
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+    inputSchema: dict[str, Any] = Field(
+        ...,
+        description='JSON Schema (draft 2020-12) for the arguments. Passed to the\nbackend verbatim; adapters needing another dialect translate\nit.\n',
     )
-    passIndex: int | None = Field(
+    channel: ToolChannel
+    effect: ToolEffect | None = 'read_only'
+
+
+class ToolCall(BaseModel):
+    """
+    A model's request to invoke a tool, surfaced in
+    `GenerateResponse.toolCalls` and carried back in `Message` for the
+    next pass. The driver only surfaces the request; the
+    orchestrator — never the driver — decides whether to execute it,
+    after the reflexive/deliberative gate and (for `irreversible`
+    efferent effects) bicameral agreement.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Call id, unique within a turn; correlates a `ToolResult` back\nto this call. Adapters map their backend's native id\n(Anthropic `tool_use.id`, OpenAI `tool_call.id`) to/from this.\n",
+    )
+    name: str = Field(
+        ..., description='Tool name, matching a registered `ToolDefinition.name`.'
+    )
+    arguments: dict[str, Any] = Field(
+        ...,
+        description="Arguments object conforming to the tool's `inputSchema`.\nAdapters parse the backend's argument representation (often a\nJSON string) into this object before returning.\n",
+    )
+
+
+class ToolResult(BaseModel):
+    """
+    The outcome of executing a `ToolCall`, produced by the singular
+    tool-runner (one effector for the whole organism — two
+    hemispheres, one set of hands) and fed back into BOTH hemispheres
+    on the next pass as a `role: tool` message.
+
+    """
+
+    callId: str = Field(..., description='The `ToolCall.id` this result answers.')
+    content: str | None = Field(
         None,
-        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
-        ge=0,
+        description='Result as text — human-readable, or JSON rendered as a string\nfor models that only consume text. Large results may be\ntruncated by the runner before feeding back.\n',
     )
-
-
-class Conversation(BaseModel):
-    """
-    An ordered list of messages constituting a conversation history.
-    """
-
-    id: UUID | None = Field(None, description='Server-assigned conversation id.')
-    messages: list[Message]
+    structuredContent: dict[str, Any] | None = Field(
+        None,
+        description="Typed result payload, for `internal` regimented calls and\nstructured tool outputs — e.g. an emotion-read returning\n`{joy: 0.1, anger: 0.7, ...}` that the orchestrator routes\ninto the NT system. Mirrors MCP's `structuredContent`. When\nboth are present, `content` is the text rendering of this.\n",
+    )
+    isError: bool | None = Field(
+        False,
+        description="True if the tool failed; the error text goes in `content`. The\nmodel sees the failure and can react (retry, pick another\ntool, give up) — like a person whose action didn't work.\n",
+    )
 
 
 class NTLevel(BaseModel):
@@ -85,22 +186,39 @@ class NTLevel(BaseModel):
 
 class DriverEntry(BaseModel):
     """
-    One operator-configured hemisphere-driver in the orchestrator's
-    topology. The orchestrator owns the `name` (free-form, used for
-    labelling messages and UI tabs); drivers themselves are anonymous
-    and report only their backend / model identity. v0.1 expects two
-    entries; v0.2+ generalizes to N (with backup/failover semantics
-    layered on top).
+    One operator-configured hemisphere-driver *slot* in the
+    orchestrator's topology. The orchestrator owns the `name`
+    (free-form, used for labelling messages and UI tabs); drivers
+    themselves are anonymous and report only their backend / model
+    identity. The bicameral loop requires exactly two slots.
+
+    A slot is a **priority list** of backends (`backends`), not a
+    single backend. Each entry is the NAME of a hemisphere-driver
+    entry in the watchdog topology (`GET /v1/components`,
+    `kind: hemisphere-driver`); the orchestrator resolves names to
+    URLs at startup. This keeps backend URLs in exactly one place
+    (the watchdog topology) instead of duplicating them into the
+    orchestrator's config (v0.2.1).
+
+    On each chat turn the orchestrator tries `backends[0]`; if it
+    fails in a cascade-eligible way (transport error / 5xx /
+    timeout) it falls through to `backends[1]`, and so on. A 4xx
+    fails the slot HARD without cascading — a 4xx is a
+    request/auth/config bug that the next backend would hit
+    identically, and cascading past it would mask the real problem.
+    Stock installs run one backend per slot.
 
     """
 
     name: str = Field(
         ...,
-        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this driver\nproduces and surfaced in the UI as the tab/column label.\n',
+        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this slot\nproduces and surfaced in the UI as the tab/column label.\n',
         min_length=1,
     )
-    url: AnyUrl = Field(
-        ..., description="Base URL where the driver's HTTP API is reachable."
+    backends: list[str] = Field(
+        ...,
+        description='Ordered priority list of watchdog-topology hemisphere-driver\nentry NAMES that back this slot. The orchestrator resolves\neach name to a URL via `GET /v1/components` at startup and\ntries them in order on each turn, cascading to the next on\ntransport error / 5xx / timeout (but not on 4xx). At least\none entry is required. (Not a URL — a topology entry name.)\n',
+        min_length=1,
     )
 
 
@@ -781,6 +899,7 @@ class FinishReason(StrEnum):
     stop = 'stop'
     length = 'length'
     stop_sequence = 'stop_sequence'
+    tool_use = 'tool_use'
     error = 'error'
 
 
@@ -827,6 +946,53 @@ class DriverInfo(BaseModel):
         None, description='Optional backend capabilities the orchestrator may key off.'
     )
     version: str | None = Field(None, description='hemisphere-driver semver.')
+
+
+class Message(BaseModel):
+    """
+    A single message in an Eugene Plexus conversation. The shape is
+    deliberately close to the OpenAI / Anthropic chat message format so
+    that adapters don't have to re-shape on every hop, but `role` includes
+    `hemisphere` for messages emitted by one of the parallel drivers
+    during a bicameral pass (visible to corpus callosum and UI debug
+    views, not normally to the end user).
+
+    """
+
+    role: Role
+    content: str = Field(
+        ...,
+        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+    )
+    driverName: str | None = Field(
+        None,
+        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
+    passIndex: int | None = Field(
+        None,
+        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
+        ge=0,
+    )
+    toolCalls: list[ToolCall] | None = Field(
+        None,
+        description='Tool-invocation requests emitted by this message. Present on\n`assistant` / `hemisphere` messages that asked for tools;\ncarried in history so the next pass sees what was requested.\n',
+    )
+    toolResults: list[ToolResult] | None = Field(
+        None,
+        description='Tool / region-call outcomes carried by a `role: tool` message\nand fed back into the next pass. A single `tool` message\nbundles the results of the calls from the preceding turn.\n',
+    )
+
+
+class Conversation(BaseModel):
+    """
+    An ordered list of messages constituting a conversation history.
+    """
+
+    id: UUID | None = Field(None, description='Server-assigned conversation id.')
+    messages: list[Message]
 
 
 class NTState(BaseModel):
@@ -1061,6 +1227,10 @@ class IncomingMessage(BaseModel):
 class GenerateResponse(BaseModel):
     content: str = Field(..., description='The generated assistant text.')
     finishReason: FinishReason
+    toolCalls: list[ToolCall] | None = Field(
+        None,
+        description='Tool-invocation requests the model emitted this turn. Non-empty\niff `finishReason == tool_use`. The orchestrator decides\nwhether and which to execute (reflexive/deliberative gate, plus\nbicameral agreement for irreversible efferent effects); the\ndriver only surfaces them.\n',
+    )
     usage: Usage | None = None
     requestId: UUID | None = None
     backend: BackendKind | None = None
@@ -1099,6 +1269,10 @@ class GenerateRequest(BaseModel):
     requestId: UUID | None = Field(
         None,
         description='Caller-supplied id for log correlation. Echoed in the response.',
+    )
+    tools: list[ToolDefinition] | None = Field(
+        None,
+        description="Tool catalog available for this generation. The driver\ntranslates each entry into its backend's native tool-calling\nmechanism and passes it through; it does not choose which to\ncall or execute any. Omitted or empty = no tools this pass\n(e.g. the voice / articulation pass, which emits speech rather\nthan tool calls). A `toolChoice` knob (auto/none/required) is\ndeferred — v0.3 leaves selection to the model.\n",
     )
 
 

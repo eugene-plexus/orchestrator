@@ -26,6 +26,7 @@ from .routes import config as config_routes
 from .routes import conversations as conversations_routes
 from .routes import health as health_routes
 from .settings import Settings, load_settings
+from .tools import build_tool_runner
 
 log = logging.getLogger(__name__)
 
@@ -352,6 +353,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         else:
             model_name = str(store.get("agreementModel") or "all-MiniLM-L6-v2")
             app.state.scorer = await asyncio.to_thread(load_default_scorer, model_name)
+
+    # Tool-wire retrofit (Phase 1): in-process tool registry. Re-expresses
+    # the orchestrator's own operations as channel-tagged tools dispatched
+    # through a ToolRunner. Built once here; reload-capable via
+    # build_tool_runner for a future config surface. Tests that inject
+    # app.state.memory get a runner over their InProcessMemory.
+    if not hasattr(app.state, "tool_runner"):
+        app.state.tool_runner = build_tool_runner(
+            memory=getattr(app.state, "memory", None),
+            identity=getattr(app.state, "identity", None),
+        )
 
     try:
         yield

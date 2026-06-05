@@ -28,52 +28,153 @@ class ChannelContextEntry(BaseModel):
 
 class Role(StrEnum):
     """
-    The speaker of a single message in a conversation.
+    The speaker of a single message in a conversation. `tool` carries
+    the result(s) of a tool / region call fed back into deliberation
+    (see ToolResult) — its own kind of utterance, distinct from the
+    `user` who originally spoke.
+
     """
 
     system = 'system'
     user = 'user'
     assistant = 'assistant'
     hemisphere = 'hemisphere'
+    tool = 'tool'
 
 
-class Message(BaseModel):
+class ToolChannel(StrEnum):
     """
-    A single message in an Eugene Plexus conversation. The shape is
-    deliberately close to the OpenAI / Anthropic chat message format so
-    that adapters don't have to re-shape on every hop, but `role` includes
-    `hemisphere` for messages emitted by one of the parallel drivers
-    during a bicameral pass (visible to corpus callosum and UI debug
-    views, not normally to the end user).
+    Direction a tool moves information relative to Eugene — the spine
+    of the perception/action model.
+
+    * `afferent` — brings world-state IN. Senses and reads: web
+      fetch, a connector delivering an inbound message, memory
+      recall, reading a file. Changes nothing in the world.
+    * `efferent` — acts ON the world. Send, write, delete, pay — and
+      notably *speaking to the user* (the Broca / voice-pass
+      effector; the user-facing reply is an efferent tool, not a
+      privileged final output). `effect` is consulted only for this
+      channel.
+    * `internal` — a regimented call to another region rather than
+      the outside world: emotion-read of an inbound message (feeds
+      NT), agreement scoring, summarization, topic-shift detection.
+      No external contact; the result typically updates internal
+      state. Reuses the same envelope so region-to-region cognition
+      threads through the identical `role: tool` machinery.
 
     """
 
-    role: Role
-    content: str = Field(
+    afferent = 'afferent'
+    efferent = 'efferent'
+    internal = 'internal'
+
+
+class ToolEffect(StrEnum):
+    """
+    Reversibility class of an `efferent` tool — drives the
+    System-1/System-2 escalation gate. Ignored for `afferent` /
+    `internal` tools, which commit nothing to the world (treat as
+    `read_only`).
+
+    * `read_only` — no world-effect (a pure read). Reflexive-eligible:
+      a single pre-deliberation stream may fire it without bicameral
+      agreement.
+    * `reversible` — an undoable side effect (compose a draft, write a
+      scratch file). The action taken *pre*-deliberation that produces
+      the artifact deliberation then edits — e.g. banging out an email
+      draft before studying it.
+    * `irreversible` — cannot be undone (send, delete, pay, post
+      publicly). Always *post*-deliberation: requires deliberation
+      plus bicameral agreement before the singular effector executes.
+
+    Reversibility is the static property; whether an action fires pre-
+    or post-deliberation is the runtime routing the gate derives from
+    it plus live NT state (anxiety can escalate even a read into
+    deliberation). Conservative default: anything not provably
+    reversible registers `irreversible`. Promotion is explicit, never
+    inferred.
+
+    """
+
+    read_only = 'read_only'
+    reversible = 'reversible'
+    irreversible = 'irreversible'
+
+
+class ToolDefinition(BaseModel):
+    """
+    A capability Eugene can invoke, normalized across backends. The
+    orchestrator owns the catalog; each hemisphere-driver adapter
+    translates this into its backend's native mechanism (Anthropic
+    tool-use blocks, OpenAI function-calling, or Hermes-style
+    `<tool_call>` text for `openai_compat_http` models without native
+    support).
+
+    """
+
+    name: str = Field(
         ...,
-        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+        description='Stable tool identifier. Echoed in `ToolCall.name`.',
+        pattern='^[a-zA-Z0-9_-]{1,64}$',
     )
-    driverName: str | None = Field(
+    description: str | None = Field(
         None,
-        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
+        description='What the tool does, in model-facing language. This is prompt\nmaterial — the model reads it to decide when to call.\n',
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+    inputSchema: dict[str, Any] = Field(
+        ...,
+        description='JSON Schema (draft 2020-12) for the arguments. Passed to the\nbackend verbatim; adapters needing another dialect translate\nit.\n',
     )
-    passIndex: int | None = Field(
+    channel: ToolChannel
+    effect: ToolEffect | None = 'read_only'
+
+
+class ToolCall(BaseModel):
+    """
+    A model's request to invoke a tool, surfaced in
+    `GenerateResponse.toolCalls` and carried back in `Message` for the
+    next pass. The driver only surfaces the request; the
+    orchestrator — never the driver — decides whether to execute it,
+    after the reflexive/deliberative gate and (for `irreversible`
+    efferent effects) bicameral agreement.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Call id, unique within a turn; correlates a `ToolResult` back\nto this call. Adapters map their backend's native id\n(Anthropic `tool_use.id`, OpenAI `tool_call.id`) to/from this.\n",
+    )
+    name: str = Field(
+        ..., description='Tool name, matching a registered `ToolDefinition.name`.'
+    )
+    arguments: dict[str, Any] = Field(
+        ...,
+        description="Arguments object conforming to the tool's `inputSchema`.\nAdapters parse the backend's argument representation (often a\nJSON string) into this object before returning.\n",
+    )
+
+
+class ToolResult(BaseModel):
+    """
+    The outcome of executing a `ToolCall`, produced by the singular
+    tool-runner (one effector for the whole organism — two
+    hemispheres, one set of hands) and fed back into BOTH hemispheres
+    on the next pass as a `role: tool` message.
+
+    """
+
+    callId: str = Field(..., description='The `ToolCall.id` this result answers.')
+    content: str | None = Field(
         None,
-        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
-        ge=0,
+        description='Result as text — human-readable, or JSON rendered as a string\nfor models that only consume text. Large results may be\ntruncated by the runner before feeding back.\n',
     )
-
-
-class Conversation(BaseModel):
-    """
-    An ordered list of messages constituting a conversation history.
-    """
-
-    id: UUID | None = Field(None, description='Server-assigned conversation id.')
-    messages: list[Message]
+    structuredContent: dict[str, Any] | None = Field(
+        None,
+        description="Typed result payload, for `internal` regimented calls and\nstructured tool outputs — e.g. an emotion-read returning\n`{joy: 0.1, anger: 0.7, ...}` that the orchestrator routes\ninto the NT system. Mirrors MCP's `structuredContent`. When\nboth are present, `content` is the text rendering of this.\n",
+    )
+    isError: bool | None = Field(
+        False,
+        description="True if the tool failed; the error text goes in `content`. The\nmodel sees the failure and can react (retry, pick another\ntool, give up) — like a person whose action didn't work.\n",
+    )
 
 
 class NTLevel(BaseModel):
@@ -794,48 +895,6 @@ class RestartResult(BaseModel):
     )
 
 
-class VoicePassRecord(BaseModel):
-    """
-    After the deliberation loop terminates (agreement or
-    cap-reached), the orchestrator runs ONE additional LLM call
-    — the "voice pass" — whose job is to convert internal
-    deliberation into a user-facing reply. The deliberation
-    hemispheres talk to each other in the loop, often slipping
-    into inner-dialog register that doesn't actually address the
-    user. The voice pass takes the deliberated content and asks
-    for a clean reply addressed to the user.
-
-    This record carries the voice pass's input + output for
-    diagnostic transparency. The `message` field on the parent
-    `ChatResponse` is the voice pass's `output` — what Eugene
-    actually said to the user.
-
-    Optional so older orchestrators that don't run a voice pass
-    keep working; v0.2.x orchestrators always emit it.
-
-    """
-
-    driverName: str = Field(
-        ...,
-        description='Which hemisphere driver performed the voice pass. Operator-\nconfigurable via `voiceDriver` on the orchestrator config;\ndefaults to the first driver in the topology.\n',
-    )
-    inputMessages: list[Message] = Field(
-        ...,
-        description='The full message list sent to the voice driver — system\nprompt + conversation history + user message + the\ninline summary of what each hemisphere considered during\ndeliberation.\n',
-    )
-    output: Message
-    latencyMs: int | None = Field(
-        None, description='Wall-clock duration of the voice pass call.', ge=0
-    )
-
-
-class HemisphereInput(BaseModel):
-    driverName: str = Field(..., description='Driver this snapshot belongs to.')
-    messages: list[Message] = Field(
-        ..., description='The full message list sent to this driver.'
-    )
-
-
 class Decision(StrEnum):
     """
     What the orchestrator did at the end of this pass.
@@ -844,27 +903,6 @@ class Decision(StrEnum):
     terminate = 'terminate'
     another_pass = 'another_pass'
     cap_reached = 'cap_reached'
-
-
-class CallosumState(BaseModel):
-    """
-    Output of the corpus-callosum blend at the end of one bicameral pass.
-    v0.1 implements only a trivial blend (string equality / length-based
-    heuristic); v0.2+ replaces this with a real disagreement signal
-    (semantic similarity, cross-hemisphere critique, etc.).
-
-    """
-
-    agreement: float = Field(
-        ...,
-        description='Estimated agreement between the two hemispheres on this pass.\n1.0 = identical content, 0.0 = orthogonal.\n',
-        ge=0.0,
-        le=1.0,
-    )
-    decision: Decision = Field(
-        ..., description='What the orchestrator did at the end of this pass.'
-    )
-    blendedMessage: Message | None = None
 
 
 class DriverProbeRequest(BaseModel):
@@ -906,45 +944,51 @@ class DriverHealth(BaseModel):
     error: str | None = Field(None, description='Populated when `reachable: false`.')
 
 
-class ChatRequest(BaseModel):
-    message: str = Field(..., description="The user's new message.")
-    personId: UUID | None = Field(
+class Message(BaseModel):
+    """
+    A single message in an Eugene Plexus conversation. The shape is
+    deliberately close to the OpenAI / Anthropic chat message format so
+    that adapters don't have to re-shape on every hop, but `role` includes
+    `hemisphere` for messages emitted by one of the parallel drivers
+    during a bicameral pass (visible to corpus callosum and UI debug
+    views, not normally to the end user).
+
+    """
+
+    role: Role
+    content: str = Field(
+        ...,
+        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
+    )
+    driverName: str | None = Field(
         None,
-        description="(v0.2) Speaker's `personId` in the identity component. The\norchestrator pulls this person's relationship summary\nfrom identity and injects it into each hemisphere's\nprompt. When omitted, the orchestrator falls back to\nthe operator's personId (UI calls without an explicit\npersonId default to the operator).\n\nConnector adapters MUST supply `personId` — they're\nnever the operator. If the adapter receives a message\nfrom an unknown platform user, it MUST file a\n`PendingIdentityLink` with the identity component\nFIRST and not call this endpoint.\n",
+        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
     )
-    conversationId: UUID | None = Field(
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
+    passIndex: int | None = Field(
         None,
-        description='Continue an existing conversation. If omitted, the orchestrator\nmints a new id and returns it in the response.\n',
+        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
+        ge=0,
     )
-    systemPrompt: str | None = Field(
+    toolCalls: list[ToolCall] | None = Field(
         None,
-        description='Optional caller-supplied system prompt. If omitted, the\norchestrator assembles one from the identity component\'s\nconstitution + relevant self-model entries + the speaker\'s\nrelationship summary, plus a hemisphere-specific\n"you are the left/right hemisphere" preamble per pass.\n',
+        description='Tool-invocation requests emitted by this message. Present on\n`assistant` / `hemisphere` messages that asked for tools;\ncarried in history so the next pass sees what was requested.\n',
     )
-    maxPasses: int | None = Field(
-        3,
-        description='Maximum number of bicameral passes before the orchestrator\nforces termination regardless of hemisphere disagreement.\n(v0.2) NT state may lower the effective cap below this\nvalue when cortisol / NE indicate Eugene should commit\nrather than deliberate further.\n',
-        ge=1,
-        le=10,
-    )
-    channelContext: list[ChannelContextEntry] | None = Field(
+    toolResults: list[ToolResult] | None = Field(
         None,
-        description="(v0.2) For connector adapters bridging channel mentions\n(Discord channels, Slack channels, Matrix rooms): recent\nplatform messages preceding the mention, for\nconversational grounding. The orchestrator may surface\nthese to hemispheres as ambient context. NOT persisted\nto memory — privacy default protects people who didn't\ninvoke Eugene.\n",
+        description='Tool / region-call outcomes carried by a `role: tool` message\nand fed back into the next pass. A single `tool` message\nbundles the results of the calls from the preceding turn.\n',
     )
-    source: MessageSource | None = Field(
-        None,
-        description='(v0.2) Where this message came from (platform / channel).\nDefaults to `{platform: ui, isDirectMessage: true}` when\nomitted (UI calls).\n',
-    )
-    requestId: UUID | None = Field(
-        None, description='Caller-supplied id for log correlation.'
-    )
-    incognito: bool | None = Field(
-        False,
-        description="(v0.2.1) Run this turn in incognito mode. When true:\n- Eugene's full identity loads (constitution + self-model)\n  — Eugene remains himself.\n- The speaker is treated as a stranger: no person lookup,\n  no relationship summary, no recent-turns retrieval from\n  memory.\n- Neither the user message nor Eugene's reply is persisted\n  to memory.\n- The running NT state is read for modulation but NOT\n  updated by this turn.\n- The conversation history for the turn comes from\n  `history` (below) instead of memory. Callers (typically\n  the UI) hold the incognito session's history client-side.\nUse for testing the inner-thought-process without identity\nand memory feedback loops, or for transient conversations\nan operator wants Eugene to forget.\n",
-    )
-    history: list[Message] | None = Field(
-        None,
-        description='(v0.2.1) Conversation history for this turn, supplied by\nthe caller. Honored only when `incognito` is true — in\nthat mode the orchestrator does not read memory, so the\ncaller must carry history forward. Ignored when\n`incognito` is false (the orchestrator loads history from\nmemory by `conversationId` as in v0.2).\n',
-    )
+
+
+class Conversation(BaseModel):
+    """
+    An ordered list of messages constituting a conversation history.
+    """
+
+    id: UUID | None = Field(None, description='Server-assigned conversation id.')
+    messages: list[Message]
 
 
 class NTState(BaseModel):
@@ -1176,6 +1220,125 @@ class IncomingMessage(BaseModel):
     )
 
 
+class VoicePassRecord(BaseModel):
+    """
+    After the deliberation loop terminates (agreement or
+    cap-reached), the orchestrator runs ONE additional LLM call
+    — the "voice pass" — whose job is to convert internal
+    deliberation into a user-facing reply. The deliberation
+    hemispheres talk to each other in the loop, often slipping
+    into inner-dialog register that doesn't actually address the
+    user. The voice pass takes the deliberated content and asks
+    for a clean reply addressed to the user.
+
+    This record carries the voice pass's input + output for
+    diagnostic transparency. The `message` field on the parent
+    `ChatResponse` is the voice pass's `output` — what Eugene
+    actually said to the user.
+
+    Optional so older orchestrators that don't run a voice pass
+    keep working; v0.2.x orchestrators always emit it.
+
+    """
+
+    driverName: str = Field(
+        ...,
+        description='Which hemisphere driver performed the voice pass. Operator-\nconfigurable via `voiceDriver` on the orchestrator config;\ndefaults to the first driver in the topology.\n',
+    )
+    inputMessages: list[Message] = Field(
+        ...,
+        description='The full message list sent to the voice driver — system\nprompt + conversation history + user message + the\ninline summary of what each hemisphere considered during\ndeliberation.\n',
+    )
+    output: Message
+    latencyMs: int | None = Field(
+        None, description='Wall-clock duration of the voice pass call.', ge=0
+    )
+
+
+class HemisphereInput(BaseModel):
+    driverName: str = Field(..., description='Driver this snapshot belongs to.')
+    messages: list[Message] = Field(
+        ..., description='The full message list sent to this driver.'
+    )
+
+
+class CallosumState(BaseModel):
+    """
+    Output of the corpus-callosum blend at the end of one bicameral pass.
+    v0.1 implements only a trivial blend (string equality / length-based
+    heuristic); v0.2+ replaces this with a real disagreement signal
+    (semantic similarity, cross-hemisphere critique, etc.).
+
+    """
+
+    agreement: float = Field(
+        ...,
+        description='Estimated agreement between the two hemispheres on this pass.\n1.0 = identical content, 0.0 = orthogonal.\n',
+        ge=0.0,
+        le=1.0,
+    )
+    decision: Decision = Field(
+        ..., description='What the orchestrator did at the end of this pass.'
+    )
+    blendedMessage: Message | None = None
+
+
+class DriversInfo(BaseModel):
+    drivers: list[DriverHealth] = Field(
+        ...,
+        description="Per-driver health snapshot, ordered as the orchestrator's\n`drivers` config declared them.\n",
+    )
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., description="The user's new message.")
+    personId: UUID | None = Field(
+        None,
+        description="(v0.2) Speaker's `personId` in the identity component. The\norchestrator pulls this person's relationship summary\nfrom identity and injects it into each hemisphere's\nprompt. When omitted, the orchestrator falls back to\nthe operator's personId (UI calls without an explicit\npersonId default to the operator).\n\nConnector adapters MUST supply `personId` — they're\nnever the operator. If the adapter receives a message\nfrom an unknown platform user, it MUST file a\n`PendingIdentityLink` with the identity component\nFIRST and not call this endpoint.\n",
+    )
+    conversationId: UUID | None = Field(
+        None,
+        description='Continue an existing conversation. If omitted, the orchestrator\nmints a new id and returns it in the response.\n',
+    )
+    systemPrompt: str | None = Field(
+        None,
+        description='Optional caller-supplied system prompt. If omitted, the\norchestrator assembles one from the identity component\'s\nconstitution + relevant self-model entries + the speaker\'s\nrelationship summary, plus a hemisphere-specific\n"you are the left/right hemisphere" preamble per pass.\n',
+    )
+    maxPasses: int | None = Field(
+        3,
+        description='Maximum number of bicameral passes before the orchestrator\nforces termination regardless of hemisphere disagreement.\n(v0.2) NT state may lower the effective cap below this\nvalue when cortisol / NE indicate Eugene should commit\nrather than deliberate further.\n',
+        ge=1,
+        le=10,
+    )
+    channelContext: list[ChannelContextEntry] | None = Field(
+        None,
+        description="(v0.2) For connector adapters bridging channel mentions\n(Discord channels, Slack channels, Matrix rooms): recent\nplatform messages preceding the mention, for\nconversational grounding. The orchestrator may surface\nthese to hemispheres as ambient context. NOT persisted\nto memory — privacy default protects people who didn't\ninvoke Eugene.\n",
+    )
+    source: MessageSource | None = Field(
+        None,
+        description='(v0.2) Where this message came from (platform / channel).\nDefaults to `{platform: ui, isDirectMessage: true}` when\nomitted (UI calls).\n',
+    )
+    requestId: UUID | None = Field(
+        None, description='Caller-supplied id for log correlation.'
+    )
+    incognito: bool | None = Field(
+        False,
+        description="(v0.2.1) Run this turn in incognito mode. When true:\n- Eugene's full identity loads (constitution + self-model)\n  — Eugene remains himself.\n- The speaker is treated as a stranger: no person lookup,\n  no relationship summary, no recent-turns retrieval from\n  memory.\n- Neither the user message nor Eugene's reply is persisted\n  to memory.\n- The running NT state is read for modulation but NOT\n  updated by this turn.\n- The conversation history for the turn comes from\n  `history` (below) instead of memory. Callers (typically\n  the UI) hold the incognito session's history client-side.\nUse for testing the inner-thought-process without identity\nand memory feedback loops, or for transient conversations\nan operator wants Eugene to forget.\n",
+    )
+    history: list[Message] | None = Field(
+        None,
+        description='(v0.2.1) Conversation history for this turn, supplied by\nthe caller. Honored only when `incognito` is true — in\nthat mode the orchestrator does not read memory, so the\ncaller must carry history forward. Ignored when\n`incognito` is false (the orchestrator loads history from\nmemory by `conversationId` as in v0.2).\n',
+    )
+
+
+class MemorySearchResult(BaseModel):
+    """
+    Ranked list of matching memory entries.
+    """
+
+    entries: list[MemorySearchHit]
+
+
 class PassRecord(BaseModel):
     passIndex: int = Field(..., ge=0)
     hemispheres: list[Message] = Field(
@@ -1189,21 +1352,6 @@ class PassRecord(BaseModel):
         min_length=0,
     )
     callosum: CallosumState
-
-
-class DriversInfo(BaseModel):
-    drivers: list[DriverHealth] = Field(
-        ...,
-        description="Per-driver health snapshot, ordered as the orchestrator's\n`drivers` config declared them.\n",
-    )
-
-
-class MemorySearchResult(BaseModel):
-    """
-    Ranked list of matching memory entries.
-    """
-
-    entries: list[MemorySearchHit]
 
 
 class ChatResponse(BaseModel):

@@ -33,13 +33,24 @@ from ..bicameral.nt import (
     Observations,
     modulated_max_passes,
     modulated_temperature,
-    tick,
 )
 from ..bicameral.voice import run_voice_pass
 from ..config import ConfigStore
 from ..hemisphere_client import HemisphereClient, HemisphereDriverError
 from ..identity import IdentityClient
 from ..memory import NIL_PERSON_ID, MemoryClient
+from ..tools import (
+    TOOL_IDENTITY_GET_CONSTITUTION,
+    TOOL_IDENTITY_GET_RELATIONSHIP,
+    TOOL_IDENTITY_LIST_PERSONS,
+    TOOL_IDENTITY_QUERY_SELF_MODEL,
+    TOOL_MEMORY_APPEND_ENTRY,
+    TOOL_MEMORY_PERSON_RECENT,
+    TOOL_NT_OBSERVE,
+    ToolContext,
+    ToolRunner,
+    new_call,
+)
 
 router = APIRouter(tags=["chat"])
 
@@ -62,14 +73,15 @@ def _build_history(history: list[Message], user_message: str) -> list[Message]:
     return out
 
 
-async def _resolve_operator_person_id(identity: IdentityClient) -> UUID | None:
+async def _resolve_operator_person_id(tool_runner: ToolRunner) -> UUID | None:
     """Look up the operator's personId from the identity component.
 
     UI chat calls don't supply `personId`; the orchestrator resolves it
     on demand. Returns None when no operator person exists yet (e.g. an
     install whose first-run wizard hasn't run `ensure_operator`).
     """
-    persons = await identity.list_persons()
+    invocation = await tool_runner.run(new_call(TOOL_IDENTITY_LIST_PERSONS))
+    persons: list[Person] = invocation.payload
     for p in persons:
         if p.isOperator:
             return p.personId
@@ -221,7 +233,7 @@ def _render_relationship(summary: RelationshipSummary, person: Person | None) ->
 async def _build_per_driver_system_prompts(
     *,
     drivers: list[HemisphereClient],
-    identity: IdentityClient | None,
+    tool_runner: ToolRunner,
     person_id: UUID | None,
     operator_person_id: UUID | None,
     user_message: str,
@@ -252,34 +264,48 @@ async def _build_per_driver_system_prompts(
 
     left, right = drivers[0], drivers[1]
 
+    # Identity is "configured" iff its tools are registered on the runner
+    # (build_tool_runner registers them only when an identity client
+    # exists). Mirrors the old `identity is not None` branch exactly.
+    identity_available = tool_runner.has(TOOL_IDENTITY_GET_CONSTITUTION)
+
     persona_body: str
     if operator_override:
         persona_body = operator_override
-    elif identity is not None:
+    elif identity_available:
         # Resolve the speaker's personId: explicit body.personId wins;
         # otherwise default to the operator (UI chat calls without a
         # personId are by-design operator turns). Incognito turns
         # short-circuit person resolution entirely — speaker is a
         # stranger by construction.
         effective_person_id = None if incognito else (person_id or operator_person_id)
-        constitution = await identity.get_constitution()
+        constitution = (await tool_runner.run(new_call(TOOL_IDENTITY_GET_CONSTITUTION))).payload
         # Incognito turns pull self-model entries with no person filter
         # (Eugene's general self-observations apply) but never load
         # person-scoped entries that bias toward a particular speaker.
-        self_model_task = identity.query_self_model(
-            topic=None,
-            person_id=None if incognito else effective_person_id,
-            limit=5,
-        )
+        self_model_entries = (
+            await tool_runner.run(
+                new_call(TOOL_IDENTITY_QUERY_SELF_MODEL),
+                ToolContext(
+                    inputs={
+                        "topic": None,
+                        "person_id": None if incognito else effective_person_id,
+                        "limit": 5,
+                    }
+                ),
+            )
+        ).payload
         if effective_person_id is not None:
-            relationship_task = identity.get_relationship(effective_person_id)
-            persons_task = identity.list_persons()
+            relationship = (
+                await tool_runner.run(
+                    new_call(TOOL_IDENTITY_GET_RELATIONSHIP),
+                    ToolContext(inputs={"person_id": effective_person_id}),
+                )
+            ).payload
+            persons = (await tool_runner.run(new_call(TOOL_IDENTITY_LIST_PERSONS))).payload
         else:
-            relationship_task = None
-            persons_task = None
-        self_model_entries = await self_model_task
-        relationship = await relationship_task if relationship_task is not None else None
-        persons = await persons_task if persons_task is not None else []
+            relationship = None
+            persons = []
         person_record = (
             next((p for p in persons if p.personId == effective_person_id), None)
             if effective_person_id is not None
@@ -393,6 +419,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     memory: MemoryClient = request.app.state.memory
     drivers: list[HemisphereClient] = request.app.state.drivers
     identity: IdentityClient | None = getattr(request.app.state, "identity", None)
+    tool_runner: ToolRunner = request.app.state.tool_runner
 
     # The bicameral loop needs exactly two driver slots. Since v0.2.1
     # item 2 slots resolve their backends against the watchdog topology
@@ -428,7 +455,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     operator_person_id: UUID | None = None
     if not incognito and identity is not None and body.personId is None:
         try:
-            operator_person_id = await _resolve_operator_person_id(identity)
+            operator_person_id = await _resolve_operator_person_id(tool_runner)
         except httpx.HTTPError as e:
             log.warning(
                 "identity service unreachable while resolving operator: %s "
@@ -483,13 +510,18 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
                 history = []
 
             user_message = Message(role=Role.user, content=body.message)
-            await memory.append_entry(
-                conversation_id,
-                _build_memory_entry(
-                    conversation_id=conversation_id,
-                    person_id=effective_person_id,
-                    message=user_message,
-                    nt_snapshot=nt_at_start,
+            await tool_runner.run(
+                new_call(TOOL_MEMORY_APPEND_ENTRY),
+                ToolContext(
+                    inputs={
+                        "conversation_id": conversation_id,
+                        "entry": _build_memory_entry(
+                            conversation_id=conversation_id,
+                            person_id=effective_person_id,
+                            message=user_message,
+                            nt_snapshot=nt_at_start,
+                        ),
+                    }
                 ),
             )
         except httpx.HTTPError as e:
@@ -513,13 +545,19 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         recent_with_person = []
         if effective_person_id != NIL_PERSON_ID:
             try:
-                recent_with_person = await memory.person_recent(
-                    effective_person_id,
-                    limit=int(store.get("personRecentLimit") or 10),
-                    # Exclude the active conversation — its turns are
-                    # already in `history` and don't need to be replayed
-                    # as ambient context.
+                invocation = await tool_runner.run(
+                    new_call(TOOL_MEMORY_PERSON_RECENT),
+                    ToolContext(
+                        inputs={
+                            "person_id": effective_person_id,
+                            "limit": int(store.get("personRecentLimit") or 10),
+                        }
+                    ),
                 )
+                recent_with_person = invocation.payload
+                # Exclude the active conversation — its turns are already
+                # in `history` and don't need to be replayed as ambient
+                # context.
                 recent_with_person = [
                     e for e in recent_with_person if e.conversationId != conversation_id
                 ]
@@ -534,7 +572,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     try:
         system_prompts = await _build_per_driver_system_prompts(
             drivers=drivers,
-            identity=identity,
+            tool_runner=tool_runner,
             person_id=body.personId,
             operator_person_id=operator_person_id,
             user_message=body.message,
@@ -708,7 +746,11 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     # response carries the would-have-been state (useful for diagnostic
     # traces) and downstream callers see a consistent shape.
     observations = _build_observations(outcome, agreement_threshold)
-    nt_at_end = tick(nt_at_start, observations=observations)
+    nt_invocation = await tool_runner.run(
+        new_call(TOOL_NT_OBSERVE),
+        ToolContext(inputs={"state": nt_at_start, "observations": observations}),
+    )
+    nt_at_end = nt_invocation.payload
     if not incognito:
         request.app.state.nt_state = nt_at_end
 
@@ -719,14 +761,19 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
 
     if not incognito:
         try:
-            await memory.append_entry(
-                conversation_id,
-                _build_memory_entry(
-                    conversation_id=conversation_id,
-                    person_id=effective_person_id,
-                    message=final_message,
-                    nt_snapshot=nt_at_end,
-                    hemisphere_attribution="voice",
+            await tool_runner.run(
+                new_call(TOOL_MEMORY_APPEND_ENTRY),
+                ToolContext(
+                    inputs={
+                        "conversation_id": conversation_id,
+                        "entry": _build_memory_entry(
+                            conversation_id=conversation_id,
+                            person_id=effective_person_id,
+                            message=final_message,
+                            nt_snapshot=nt_at_end,
+                            hemisphere_attribution="voice",
+                        ),
+                    }
                 ),
             )
         except httpx.HTTPError as e:
