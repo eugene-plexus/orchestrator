@@ -17,6 +17,7 @@ To bump to a newer specs commit, overwrite `SPECS_REF` and re-run.
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,16 @@ GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_orchestrator" / "_generated"
 WORKING_DIR = REPO_ROOT / ".codegen-cache"
 
 SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{ref}.tar.gz"
+
+# Dev-only escape hatch: when this env var points at a local `specs`
+# checkout, codegen reads that working tree instead of fetching the
+# pinned commit from GitHub. Used to iterate on an unpublished spec
+# (e.g. validating a provisional schema before it's committed/pushed).
+# The generated code is marked `<ref>+local` and WILL differ from the
+# pinned commit — CI regenerates from the pinned ref and will fail, so
+# never merge local-generated output without first publishing the spec
+# and bumping SPECS_REF.
+SPECS_LOCAL_ENV = "EUGENE_PLEXUS_SPECS_LOCAL_PATH"
 
 # The orchestrator's wire surface is orchestrator.yaml (chat, conversations,
 # config, admin). It also *consumes* hemisphere-driver.yaml as an HTTP
@@ -144,8 +155,21 @@ def run_codegen(specs_root: Path, ref: str) -> None:
 
 def main() -> None:
     ref = read_specs_ref()
-    print(f"specs ref: {ref}")
 
+    local = os.environ.get(SPECS_LOCAL_ENV)
+    if local:
+        specs_root = Path(local).resolve()
+        if not (specs_root / "openapi").is_dir():
+            sys.exit(f"error: {SPECS_LOCAL_ENV}={local} has no openapi/ dir")
+        print(f"using LOCAL specs at {specs_root} (pin {ref}; output is DEV-ONLY)")
+        run_codegen(specs_root, f"{ref}+local")
+        print(
+            f"wrote {GENERATED_DIR.relative_to(REPO_ROOT)} — LOCAL/dev output; "
+            "do not merge without publishing the spec and bumping SPECS_REF"
+        )
+        return
+
+    print(f"specs ref: {ref}")
     specs_root = download_specs(ref)
 
     try:
