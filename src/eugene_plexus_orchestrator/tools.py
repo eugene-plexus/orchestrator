@@ -32,7 +32,9 @@ lifespan startup and stored on `app.state.tool_runner`.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -42,6 +44,7 @@ from ._generated.models import (
     ToolChannel,
     ToolDefinition,
     ToolEffect,
+    ToolInvocationRecord,
     ToolResult,
 )
 from .identity import IdentityClient
@@ -95,6 +98,28 @@ class ToolInvocation:
 ToolExecutor = Callable[[ToolCall, ToolContext], Awaitable[ToolInvocation]]
 
 
+# Per-turn tool-invocation trace. `begin_tool_trace()` is called once at
+# the start of a chat turn (before any tool runs); ToolRunner.run appends
+# a ToolInvocationRecord per call. Task-local (ContextVar), so concurrent
+# requests never share a trace; a fresh list is set at the top of every
+# turn, so no stale data can bleed across sequential requests that reuse a
+# task — hence no explicit reset is required.
+_tool_trace: ContextVar[list[ToolInvocationRecord] | None] = ContextVar(
+    "eugene_plexus_tool_trace", default=None
+)
+
+
+def begin_tool_trace() -> list[ToolInvocationRecord]:
+    """Start capturing tool invocations for the current turn.
+
+    Returns the list ToolRunner.run will append to; attach it to
+    `ChatResponse.toolInvocations` once the turn completes.
+    """
+    trace: list[ToolInvocationRecord] = []
+    _tool_trace.set(trace)
+    return trace
+
+
 def new_call(name: str, **arguments: Any) -> ToolCall:
     """Construct a `ToolCall` with a fresh id.
 
@@ -134,10 +159,26 @@ class ToolRunner:
             # orchestrator only invokes tools it registered), not a model
             # misfire — fail loud rather than returning an isError result.
             raise KeyError(f"no tool registered under {call.name!r}")
-        _definition, executor = entry
+        definition, executor = entry
+        started = time.monotonic()
         # Exceptions propagate (see module docstring) — this is what keeps
-        # the chat handler's existing error mapping behavior-identical.
-        return await executor(call, ctx or ToolContext())
+        # the chat handler's existing error mapping behavior-identical. A
+        # raising tool is therefore not traced; the turn fails and returns
+        # no response anyway.
+        invocation = await executor(call, ctx or ToolContext())
+        trace = _tool_trace.get()
+        if trace is not None:
+            trace.append(
+                ToolInvocationRecord(
+                    name=definition.name,
+                    channel=definition.channel,
+                    effect=definition.effect,
+                    summary=invocation.result.content,
+                    isError=bool(invocation.result.isError),
+                    latencyMs=int((time.monotonic() - started) * 1000),
+                )
+            )
+        return invocation
 
 
 # --------------------------------------------------------------------------- #

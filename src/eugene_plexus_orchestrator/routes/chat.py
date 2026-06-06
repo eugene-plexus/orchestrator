@@ -49,6 +49,7 @@ from ..tools import (
     TOOL_NT_OBSERVE,
     ToolContext,
     ToolRunner,
+    begin_tool_trace,
     new_call,
 )
 
@@ -420,6 +421,10 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     drivers: list[HemisphereClient] = request.app.state.drivers
     identity: IdentityClient | None = getattr(request.app.state, "identity", None)
     tool_runner: ToolRunner = request.app.state.tool_runner
+    # Start capturing this turn's tool invocations for the response trace
+    # (the UI's primary debug surface). Set before any tool runs; the
+    # ToolRunner appends a record per call.
+    tool_invocations = begin_tool_trace()
 
     # The bicameral loop needs exactly two driver slots. Since v0.2.1
     # item 2 slots resolve their backends against the watchdog topology
@@ -799,6 +804,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             output=voice_outcome.output,
             latencyMs=voice_outcome.latency_ms,
         ),
+        toolInvocations=tool_invocations,
         ntStateAtStart=nt_at_start,
         ntStateAtEnd=nt_at_end,
         requestId=body.requestId,

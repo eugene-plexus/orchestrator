@@ -895,6 +895,36 @@ class RestartResult(BaseModel):
     )
 
 
+class ToolInvocationRecord(BaseModel):
+    """
+    Diagnostic record of one tool invocation during a chat turn —
+    a ToolCall/ToolResult pair flattened for the trace: what ran, on
+    which channel, its reversibility class, a short result summary,
+    and timing. The UI's bicameral-trace view renders these as the
+    perception/action layer beneath deliberation. Result payloads are
+    NOT included — only the human-readable summary — so the trace
+    stays small and free of (potentially sensitive) recalled content.
+
+    """
+
+    name: str = Field(
+        ..., description='Tool name (matches the registered ToolDefinition.name).'
+    )
+    channel: ToolChannel
+    effect: ToolEffect | None = None
+    summary: str | None = Field(
+        None,
+        description='Short human-readable result summary (the ToolResult.content),\ne.g. "12 recent entries", "constitution", "nt state advanced".\n',
+    )
+    isError: bool | None = Field(
+        False,
+        description="True if the tool failed. Phase-1 tool errors propagate to the\nchat handler's existing error mapping instead, so this is\nnormally false until Phase 2 (model-driven tools).\n",
+    )
+    latencyMs: int | None = Field(
+        None, description='Wall-clock duration of the tool invocation.', ge=0
+    )
+
+
 class Decision(StrEnum):
     """
     What the orchestrator did at the end of this pass.
@@ -1362,6 +1392,10 @@ class ChatResponse(BaseModel):
         description='Per-pass record of what each driver said and how the corpus\ncallosum scored agreement. `passes[N].hemispheres` has one\nentry per configured driver that responded — two in v0.1.\n',
     )
     voicePass: VoicePassRecord | None = None
+    toolInvocations: list[ToolInvocationRecord] | None = Field(
+        None,
+        description="Ordered diagnostic record of every tool the orchestrator\ninvoked during this turn — afferent reads (memory recall,\nidentity), efferent writes (memory persistence), and internal\nregimented calls (NT observation). The primary debug surface\nfor the tool-calling substrate: the UI renders these alongside\nthe bicameral passes so an operator sees Eugene's\nperception/action flow, not just deliberation. Phase-1 tools\nare orchestrator-constructed (the model does not yet emit tool\ncalls); this trace shows what ran regardless. Optional —\norchestrators without the tool retrofit omit it.\n",
+    )
     ntStateAtStart: NTState | None = None
     ntStateAtEnd: NTState | None = None
     requestId: UUID | None = None
