@@ -6,7 +6,7 @@ Per specs/openapi/orchestrator.yaml: when started with
   - skip loading its persisted config file (defaults only)
   - still expose /v1/config endpoints (operator can repair via UI)
   - report /healthz as `degraded` with `safeMode: true`
-  - return 503 from /v1/chat (no drivers configured)
+  - return 503 from /v1/events (no drivers configured)
   - allow PATCH /v1/config to write to the on-disk file as normal
 """
 
@@ -76,8 +76,13 @@ def test_config_get_returns_defaults_not_disk_values(safe_mode_client: TestClien
     )
 
 
-def test_chat_returns_503_in_safe_mode(safe_mode_client: TestClient) -> None:
-    response = safe_mode_client.post("/v1/chat", json={"message": "hi"})
+def test_events_return_503_in_safe_mode(safe_mode_client: TestClient) -> None:
+    from tests.conftest import make_message_event
+
+    response = safe_mode_client.post(
+        "/v1/events",
+        json=make_message_event("hi").model_dump(mode="json", exclude_none=True),
+    )
     assert response.status_code == 503
 
 

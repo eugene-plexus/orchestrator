@@ -1,17 +1,19 @@
-"""Orchestrator-side v0.2 memory integration tests.
+"""Continuous-loop memory + personId wiring tests (M2 slice 2 rewrite).
 
-These verify the contract changes from the memory-upgrade phase:
+These verify the memory contract the loop preserves from the v0.2 chat
+handler, now driven through `drive_message` instead of `POST /v1/chat`:
 
-  - Chat handler writes a full MemoryEntry (personId, NT snapshot,
-    hemisphereAttribution="blended" on the reply) — not a bare Message.
+  - The loop writes full MemoryEntries (personId, NT snapshot,
+    hemisphereAttribution="voice" on the reply, reply content = the voice
+    pass output) — not bare Messages.
   - When identity resolves an operator personId, both writes for the
     turn use that personId.
-  - body.personId from the request body wins over the operator fallback.
-  - When neither identity nor body.personId provide a personId, writes
-    fall back to NIL_PERSON_ID without failing the chat turn.
-  - `person_recent` is consulted only for non-NIL personIds, and the
-    active conversation is excluded from the recent-turns context
-    (those turns are already in `history`).
+  - An explicit (body) personId wins over the operator fallback.
+  - With neither identity nor an explicit personId, writes fall back to
+    NIL_PERSON_ID without failing the turn.
+  - `person_recent` enrichment is injected into the hemisphere prompts
+    only for non-NIL personIds, excluding the active conversation.
+  - For a NIL person, `person_recent` is skipped — no NIL-bucket leak.
 """
 
 from __future__ import annotations
@@ -19,29 +21,44 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from fastapi.testclient import TestClient
-
+from eugene_plexus_orchestrator._generated.hemisphere_models import Role as HemisphereRole
 from eugene_plexus_orchestrator._generated.models import (
     Constitution,
     MemoryEntry,
     Person,
     Role,
 )
-from eugene_plexus_orchestrator.app import create_app
 from eugene_plexus_orchestrator.identity import InProcessIdentity
 from eugene_plexus_orchestrator.memory import NIL_PERSON_ID, InProcessMemory
 from eugene_plexus_orchestrator.settings import Settings
-from tests.conftest import FakeHemisphereClient
+from tests.conftest import (
+    FakeHemisphereClient,
+    build_loop_app,
+    drive_message,
+    make_message_event,
+)
 
 
-def test_chat_writes_full_memory_entries_with_resolved_personid(
+def _speech_conversation_id(events: list[tuple[str, dict]]) -> UUID:
+    """Pull the conversationId the loop spoke into off the `speech` event."""
+    speech = next(data for kind, data in events if kind == "speech")
+    return UUID(speech["conversationId"])
+
+
+def _system_message(fake: FakeHemisphereClient) -> str:
+    """The system prompt that reached a hemisphere on its first call."""
+    return next(m.content for m in fake.calls[0].messages if m.role == HemisphereRole.system)
+
+
+async def test_loop_writes_full_memory_entries_with_resolved_personid(
     settings: Settings,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    """When identity is wired, both writes (user turn + Eugene's reply)
-    carry the operator's personId, an NT snapshot, and the reply is
-    tagged `hemisphereAttribution: blended`."""
+    """When identity is wired and the message posts NIL (a "this is the
+    operator" UI marker), both writes carry the operator's personId, an NT
+    snapshot, and the reply is tagged `hemisphereAttribution="voice"` with
+    content = the voice pass output."""
     operator_id = uuid4()
     operator = Person(
         personId=operator_id,
@@ -50,23 +67,17 @@ def test_chat_writes_full_memory_entries_with_resolved_personid(
         createdAt=datetime.now(UTC),
     )
 
-    app = create_app(settings=settings)
-    app.state.drivers = [left_fake, right_fake]
     memory = InProcessMemory()
-    app.state.memory = memory
-    app.state.memory_url = "in-process"
-    app.state.identity = InProcessIdentity(persons=[operator])
-    app.state.identity_url = "in-process"
+    identity = InProcessIdentity(persons=[operator])
+    app = build_loop_app(settings, [left_fake, right_fake], memory=memory, identity=identity)
 
-    # v0.2.x voice pass runs after deliberation; extra left response
-    # covers the voice pass call.
+    # Voice pass runs after deliberation; the extra left response covers it.
     left_fake.responses = ["hi", "hi voice"]
     right_fake.responses = ["hi"]
-    with TestClient(app) as client:
-        response = client.post("/v1/chat", json={"message": "hello"})
-    assert response.status_code == 200, response.text
 
-    cid = UUID(response.json()["conversationId"])
+    events = await drive_message(app, make_message_event("hello"))
+
+    cid = _speech_conversation_id(events)
     entries = memory._conversations[cid]
     assert len(entries) == 2
 
@@ -75,24 +86,24 @@ def test_chat_writes_full_memory_entries_with_resolved_personid(
     assert reply_entry.personId == operator_id
     assert user_entry.role == Role.user
     assert reply_entry.role == Role.assistant
-    # v0.2.x: the reply Eugene actually sends is the voice pass output,
-    # tagged with hemisphereAttribution="voice" instead of "blended".
+    # The reply Eugene actually sends is the voice pass output, tagged
+    # hemisphereAttribution="voice".
     assert reply_entry.hemisphereAttribution == "voice"
     assert reply_entry.content == "hi voice"
-    # NT snapshot present on both — gives the v0.3+ analyser something
-    # to correlate output style against state.
+    # NT snapshot present on both — gives the v0.3+ analyser something to
+    # correlate output style against state.
     assert user_entry.ntStateSnapshot is not None
     assert reply_entry.ntStateSnapshot is not None
 
 
-def test_chat_body_personid_wins_over_operator_fallback(
+async def test_loop_body_personid_wins_over_operator_fallback(
     settings: Settings,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    """Connector adapters supply body.personId. Even when an operator
-    is registered, that explicit personId must win — the speaker isn't
-    the operator."""
+    """Connector adapters supply an explicit personId on the message. Even
+    when an operator is registered, that explicit personId must win — the
+    speaker isn't the operator."""
     operator_id = uuid4()
     other_id = uuid4()
     operator = Person(
@@ -108,64 +119,51 @@ def test_chat_body_personid_wins_over_operator_fallback(
         createdAt=datetime.now(UTC),
     )
 
-    app = create_app(settings=settings)
-    app.state.drivers = [left_fake, right_fake]
     memory = InProcessMemory()
-    app.state.memory = memory
-    app.state.memory_url = "in-process"
-    app.state.identity = InProcessIdentity(persons=[operator, other])
-    app.state.identity_url = "in-process"
+    identity = InProcessIdentity(persons=[operator, other])
+    app = build_loop_app(settings, [left_fake, right_fake], memory=memory, identity=identity)
 
-    left_fake.responses = ["hi"]
+    left_fake.responses = ["hi", "hi voice"]
     right_fake.responses = ["hi"]
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/chat",
-            json={"message": "hello", "personId": str(other_id)},
-        )
-    assert response.status_code == 200, response.text
 
-    cid = UUID(response.json()["conversationId"])
+    events = await drive_message(app, make_message_event("hello", person_id=other_id))
+
+    cid = _speech_conversation_id(events)
     entries = memory._conversations[cid]
+    assert entries  # the turn produced writes
     assert all(e.personId == other_id for e in entries)
 
 
-def test_chat_falls_back_to_NIL_personid_when_no_identity_and_no_body(
+async def test_loop_falls_back_to_NIL_personid_when_no_identity_and_no_body(
     settings: Settings,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    """No identity component + no body.personId = NIL_PERSON_ID. Chat
-    still succeeds — orchestrator never fails the turn over personId
-    resolution alone."""
-    app = create_app(settings=settings)
-    app.state.drivers = [left_fake, right_fake]
+    """No identity component + NIL personId on the message = NIL_PERSON_ID
+    on the writes. The turn still completes — the loop never fails over
+    personId resolution alone."""
     memory = InProcessMemory()
-    app.state.memory = memory
-    app.state.memory_url = "in-process"
-    app.state.identity = None
-    app.state.identity_url = ""
+    app = build_loop_app(settings, [left_fake, right_fake], memory=memory, identity=None)
 
-    left_fake.responses = ["hi"]
+    left_fake.responses = ["hi", "hi voice"]
     right_fake.responses = ["hi"]
-    with TestClient(app) as client:
-        response = client.post("/v1/chat", json={"message": "hello"})
-    assert response.status_code == 200, response.text
 
-    cid = UUID(response.json()["conversationId"])
+    events = await drive_message(app, make_message_event("hello"))
+
+    cid = _speech_conversation_id(events)
     entries = memory._conversations[cid]
+    assert len(entries) == 2
     assert all(e.personId == NIL_PERSON_ID for e in entries)
 
 
-def test_chat_injects_recent_turns_from_prior_conversations(
+async def test_loop_injects_recent_turns_from_prior_conversations(
     settings: Settings,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
     """Memory's recent turns with the speaker get injected into the
-    hemisphere prompts — concrete context, not just identity's
-    summary. Turns from the CURRENT conversation are excluded (already
-    in `history`)."""
+    hemisphere prompts — concrete context, not just identity's summary.
+    Turns from the CURRENT conversation are excluded (already in history)."""
     operator_id = uuid4()
     operator = Person(
         personId=operator_id,
@@ -175,7 +173,7 @@ def test_chat_injects_recent_turns_from_prior_conversations(
     )
 
     memory = InProcessMemory()
-    # Pre-seed a prior conversation with three turns from the operator.
+    # Pre-seed a prior conversation with two turns from the operator.
     prior_cid = uuid4()
     memory._conversations[prior_cid] = [
         MemoryEntry(
@@ -196,40 +194,34 @@ def test_chat_injects_recent_turns_from_prior_conversations(
         ),
     ]
 
-    app = create_app(settings=settings)
-    app.state.drivers = [left_fake, right_fake]
-    app.state.memory = memory
-    app.state.memory_url = "in-process"
-    app.state.identity = InProcessIdentity(
+    identity = InProcessIdentity(
         constitution=Constitution(name="Eugene"),
         persons=[operator],
     )
-    app.state.identity_url = "in-process"
+    app = build_loop_app(settings, [left_fake, right_fake], memory=memory, identity=identity)
 
-    left_fake.responses = ["hi"]
+    left_fake.responses = ["hi", "hi voice"]
     right_fake.responses = ["hi"]
-    with TestClient(app) as client:
-        response = client.post("/v1/chat", json={"message": "remember?"})
-    assert response.status_code == 200, response.text
 
-    # System message in each hemisphere's GenerateRequest carries the
-    # prior-conversation recap.
+    await drive_message(app, make_message_event("remember?"))
+
+    # The system message in each hemisphere's first GenerateRequest carries
+    # the prior-conversation recap.
     for fake in (left_fake, right_fake):
-        sys_msg = next(m.content for m in fake.calls[0].messages if m.role == Role.system)
+        sys_msg = _system_message(fake)
         assert "cats last week" in sys_msg
         assert "favorite species" in sys_msg
         assert "Recent turns with this person" in sys_msg
 
 
-def test_chat_skips_recent_turns_for_nil_person(
+async def test_loop_skips_recent_turns_for_nil_person(
     settings: Settings,
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    """When personId resolves to NIL, the orchestrator must NOT call
-    `person_recent` — that would surface unrelated NIL-bucket entries
-    from prior anonymous turns, which would be confusing rather than
-    helpful."""
+    """When the speaker resolves to NIL, the loop must NOT call
+    `person_recent` — that would surface unrelated NIL-bucket entries from
+    prior anonymous turns, which would be confusing rather than helpful."""
     memory = InProcessMemory()
     # Pre-seed a NIL-bucket entry from a prior anonymous turn.
     prior_cid = uuid4()
@@ -244,19 +236,13 @@ def test_chat_skips_recent_turns_for_nil_person(
         ),
     ]
 
-    app = create_app(settings=settings)
-    app.state.drivers = [left_fake, right_fake]
-    app.state.memory = memory
-    app.state.memory_url = "in-process"
-    app.state.identity = None
-    app.state.identity_url = ""
+    app = build_loop_app(settings, [left_fake, right_fake], memory=memory, identity=None)
 
-    left_fake.responses = ["hi"]
+    left_fake.responses = ["hi", "hi voice"]
     right_fake.responses = ["hi"]
-    with TestClient(app) as client:
-        response = client.post("/v1/chat", json={"message": "hello"})
-    assert response.status_code == 200, response.text
+
+    await drive_message(app, make_message_event("hello"))
 
     for fake in (left_fake, right_fake):
-        sys_msg = next(m.content for m in fake.calls[0].messages if m.role == Role.system)
+        sys_msg = _system_message(fake)
         assert "UNRELATED_NIL_BUCKET_LEAK_CANARY" not in sys_msg

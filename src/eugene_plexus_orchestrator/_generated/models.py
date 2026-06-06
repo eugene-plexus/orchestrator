@@ -10,20 +10,47 @@ from uuid import UUID
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
 
 
-class ChannelContextEntry(BaseModel):
+class Action(StrEnum):
     """
-    One message from the channel that precedes Eugene's
-    invocation. Used by adapters to provide grounding context
-    for channel mentions. Not persisted to memory.
+    The elected action — take another `thought` on the current
+    focus, `switch` attention to a different focus, `speak` (emit
+    an `EfferentSpeechAct`), `idle` (nothing salient — a low-grade
+    seeking floor, not true rest), or `sleep` (adenosine high —
+    offline consolidation).
 
     """
 
-    author: str = Field(
+    think = 'think'
+    switch = 'switch'
+    speak = 'speak'
+    idle = 'idle'
+    sleep = 'sleep'
+
+
+class GateDecision(BaseModel):
+    """
+    The action-selection gate's choice on one loop iteration. The
+    gate hill-climbs on anticipated net NT valence — it elects the
+    action with the highest expected reward (and lowest anticipated
+    aversive cost). There are no fixed step counts or termination
+    thresholds; "keep thinking vs. act vs. rest" is purely this
+    valence comparison. Emitted on `GET /v1/stream/consciousness` as
+    the `gate_decision` event.
+
+    """
+
+    action: Action = Field(
         ...,
-        description="Platform display name of the speaker. Free-form;\nEugene doesn't try to resolve to known persons (would\nrequire trust-establishing flows that v0.2 doesn't\nhave for non-mention authors).\n",
+        description='The elected action — take another `thought` on the current\nfocus, `switch` attention to a different focus, `speak` (emit\nan `EfferentSpeechAct`), `idle` (nothing salient — a low-grade\nseeking floor, not true rest), or `sleep` (adenosine high —\noffline consolidation).\n',
     )
-    content: str
-    timestamp: AwareDatetime
+    anticipatedValence: float | None = Field(
+        None,
+        description='The expected net NT reward that drove the choice, for\ndiagnostics. Higher = the gate expected this action to feel\nbetter than the alternatives.\n',
+    )
+    focus: str | None = Field(
+        None,
+        description='Human-readable label of the current focus (a conversationId,\nan internal topic, or absent when idle) — diagnostic context\nfor the decision.\n',
+    )
 
 
 class Role(StrEnum):
@@ -867,6 +894,22 @@ class MessageSource(BaseModel):
     isDirectMessage: bool | None = False
 
 
+class ChannelContextEntry(BaseModel):
+    """
+    One message from the channel that precedes Eugene's
+    invocation. Used by adapters to provide grounding context
+    for channel mentions. Not persisted to memory.
+
+    """
+
+    author: str = Field(
+        ...,
+        description="Platform display name of the speaker. Free-form;\nEugene doesn't try to resolve to known persons (would\nrequire trust-establishing flows that v0.2 doesn't\nhave for non-mention authors).\n",
+    )
+    content: str
+    timestamp: AwareDatetime
+
+
 class RestartResult(BaseModel):
     """
     Acknowledgement returned by `POST /v1/admin/restart`. The
@@ -893,6 +936,99 @@ class RestartResult(BaseModel):
         None,
         description='Optional human-readable note (e.g. "logs flushed, exiting\nnow"). UI may display this in the restart-progress dialog.\n',
     )
+
+
+class Kind(StrEnum):
+    """
+    Discriminates the payload. Extensible — future afferent
+    modalities (timer, sensor, …) add an enum value + a payload
+    field without changing the envelope.
+
+    """
+
+    message = 'message'
+    presence = 'presence'
+
+
+class Change(StrEnum):
+    """
+    The occupancy transition observed.
+    """
+
+    entered = 'entered'
+    left = 'left'
+
+
+class PresenceEvent(BaseModel):
+    """
+    Afferent perception of the social environment's *occupancy* —
+    who entered or left an environment — distinct from message
+    content. This is the external trigger that lets Eugene
+    *initiate* (not just respond): the continuous loop + speak-as-a-
+    decision give the ability to start talking; presence gives the
+    social cue to.
+
+    Presence is a LOSSY, NT-modulated salience signal, NOT a queue:
+    most occupancy churn is low-salience and never attended (the
+    loop drops it), the same way a person doesn't consciously track
+    everyone's comings and goings. Salience is gated by NT state —
+    wary attends to strangers, relaxed attends to known persons.
+    Restraint about acting on presence is *learned*, not a policy
+    knob.
+
+    Actor resolution ties into identity: an enter/leave resolves to
+    a `personId` when known, otherwise to a `PlatformAlias` / the
+    pending-link flow. "X entered" only means something once X is a
+    known person.
+
+    """
+
+    change: Change = Field(..., description='The occupancy transition observed.')
+    environment: MessageSource = Field(
+        ...,
+        description='The environment (platform / channel) whose occupancy\nchanged. Reuses `MessageSource` addressing.\n',
+    )
+    personId: UUID | None = Field(
+        None,
+        description='The actor, resolved to a known person. Omitted when the\nactor is unknown — see `alias`.\n',
+    )
+    alias: PlatformAlias | None = Field(
+        None,
+        description='Set instead of `personId` when the actor is an unrecognized\nplatform user (routes to the pending-link flow rather than\nto relationship-aware behavior).\n',
+    )
+
+
+class EfferentSpeechAct(BaseModel):
+    """
+    An efferent (act-out) utterance Eugene has *decided* to emit.
+    Speech is not a privileged terminal step — it is an efferent
+    action the gate elects when speaking has higher anticipated
+    reward than continuing to think or staying silent. Silence is a
+    valid outcome and simply produces no `EfferentSpeechAct`.
+
+    Routed to a destination by the speak effector: a reply in a
+    Discord channel goes to the connector's outbound API for that
+    channel; a reply in the UI goes to the UI's speech stream;
+    *initiated* speech (no triggering event) picks its destination
+    from social context. `destination` reuses `MessageSource`
+    addressing — the mirror of an `AfferentEvent.source`.
+
+    """
+
+    destination: MessageSource = Field(
+        ...,
+        description='Where the utterance is delivered (mirror of afferent `source`).',
+    )
+    content: str
+    inResponseTo: UUID | None = Field(
+        None,
+        description='The `AfferentEvent.eventId` this utterance reacts to, when\nreactive. Omitted for self-initiated speech (mind-wandering,\npresence-triggered) — Eugene speaking on its own initiative,\nnot in reply to a specific event.\n',
+    )
+    conversationId: UUID | None = Field(
+        None,
+        description='Conversation thread the utterance belongs to, when applicable.',
+    )
+    timestamp: AwareDatetime
 
 
 class ToolInvocationRecord(BaseModel):
@@ -1228,15 +1364,16 @@ class RelationshipSummary(BaseModel):
 class IncomingMessage(BaseModel):
     """
     Normalized message shape an adapter posts to the
-    orchestrator's `POST /v1/chat`. Adapter-specific platform
-    details collapse to this universal shape; the orchestrator
-    never sees Discord-specific or Slack-specific fields.
+    orchestrator, wrapped in an `AfferentEvent` (`kind: message`)
+    to `POST /v1/events`. Adapter-specific platform details
+    collapse to this universal shape; the orchestrator never sees
+    Discord-specific or Slack-specific fields.
 
     """
 
     personId: UUID = Field(
         ...,
-        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not call `/v1/chat` — Eugene only responds to\nknown people.\n",
+        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not post the event — Eugene only responds to\nknown people.\n",
     )
     conversationId: UUID | None = Field(
         None,
@@ -1250,38 +1387,44 @@ class IncomingMessage(BaseModel):
     )
 
 
-class VoicePassRecord(BaseModel):
+class AfferentEvent(BaseModel):
     """
-    After the deliberation loop terminates (agreement or
-    cap-reached), the orchestrator runs ONE additional LLM call
-    — the "voice pass" — whose job is to convert internal
-    deliberation into a user-facing reply. The deliberation
-    hemispheres talk to each other in the loop, often slipping
-    into inner-dialog register that doesn't actually address the
-    user. The voice pass takes the deliberated content and asks
-    for a clean reply addressed to the user.
+    A single afferent (perception-in) event injected into the
+    orchestrator's continuous loop via `POST /v1/events`. The
+    unified envelope for everything Eugene perceives — a person's
+    message, a presence change, and future sensory inputs all arrive
+    as one shape, differing only by `kind` and the typed payload.
 
-    This record carries the voice pass's input + output for
-    diagnostic transparency. The `message` field on the parent
-    `ChatResponse` is the voice pass's `output` — what Eugene
-    actually said to the user.
+    Injection is fire-and-forget: the endpoint enqueues the event
+    and returns `202` immediately. Whether, when, and how Eugene
+    responds is the loop's decision, not this call's — there is no
+    synchronous reply (the request-response `/v1/chat` surface was
+    removed). Speech leaves asynchronously; see `EfferentSpeechAct`
+    and `GET /v1/stream/consciousness`.
 
-    Optional so older orchestrators that don't run a voice pass
-    keep working; v0.2.x orchestrators always emit it.
+    An unsolicited event arriving keeps `role: user` semantics —
+    Eugene did not "call hear." Only Eugene's *interpretation* of it
+    (and any solicited perception) is an afferent tool cycle.
 
     """
 
-    driverName: str = Field(
+    eventId: UUID = Field(
         ...,
-        description='Which hemisphere driver performed the voice pass. Operator-\nconfigurable via `voiceDriver` on the orchestrator config;\ndefaults to the first driver in the topology.\n',
+        description="Caller-minted id. Echoed by any resulting `EfferentSpeechAct`\nin `inResponseTo` when Eugene's reply is reactive to this\nevent, for correlation.\n",
     )
-    inputMessages: list[Message] = Field(
+    kind: Kind = Field(
         ...,
-        description='The full message list sent to the voice driver — system\nprompt + conversation history + user message + the\ninline summary of what each hemisphere considered during\ndeliberation.\n',
+        description='Discriminates the payload. Extensible — future afferent\nmodalities (timer, sensor, …) add an enum value + a payload\nfield without changing the envelope.\n',
     )
-    output: Message
-    latencyMs: int | None = Field(
-        None, description='Wall-clock duration of the voice pass call.', ge=0
+    source: MessageSource = Field(
+        ..., description='Where the event came from (platform / channel).'
+    )
+    timestamp: AwareDatetime
+    message: IncomingMessage | None = Field(
+        None, description='Present when `kind` is `message`.'
+    )
+    presence: PresenceEvent | None = Field(
+        None, description='Present when `kind` is `presence`.'
     )
 
 
@@ -1320,44 +1463,38 @@ class DriversInfo(BaseModel):
     )
 
 
-class ChatRequest(BaseModel):
-    message: str = Field(..., description="The user's new message.")
-    personId: UUID | None = Field(
-        None,
-        description="(v0.2) Speaker's `personId` in the identity component. The\norchestrator pulls this person's relationship summary\nfrom identity and injects it into each hemisphere's\nprompt. When omitted, the orchestrator falls back to\nthe operator's personId (UI calls without an explicit\npersonId default to the operator).\n\nConnector adapters MUST supply `personId` — they're\nnever the operator. If the adapter receives a message\nfrom an unknown platform user, it MUST file a\n`PendingIdentityLink` with the identity component\nFIRST and not call this endpoint.\n",
+class VoicePassRecord(BaseModel):
+    """
+    After the deliberation loop terminates (agreement or
+    cap-reached), the orchestrator runs ONE additional LLM call
+    — the "voice pass" — whose job is to convert internal
+    deliberation into a user-facing reply. The deliberation
+    hemispheres talk to each other in the loop, often slipping
+    into inner-dialog register that doesn't actually address the
+    user. The voice pass takes the deliberated content and asks
+    for a clean reply addressed to the user.
+
+    This record carries the voice pass's input + output for
+    diagnostic transparency. The `message` field on the parent
+    `ChatResponse` is the voice pass's `output` — what Eugene
+    actually said to the user.
+
+    Optional so older orchestrators that don't run a voice pass
+    keep working; v0.2.x orchestrators always emit it.
+
+    """
+
+    driverName: str = Field(
+        ...,
+        description='Which hemisphere driver performed the voice pass. Operator-\nconfigurable via `voiceDriver` on the orchestrator config;\ndefaults to the first driver in the topology.\n',
     )
-    conversationId: UUID | None = Field(
-        None,
-        description='Continue an existing conversation. If omitted, the orchestrator\nmints a new id and returns it in the response.\n',
+    inputMessages: list[Message] = Field(
+        ...,
+        description='The full message list sent to the voice driver — system\nprompt + conversation history + user message + the\ninline summary of what each hemisphere considered during\ndeliberation.\n',
     )
-    systemPrompt: str | None = Field(
-        None,
-        description='Optional caller-supplied system prompt. If omitted, the\norchestrator assembles one from the identity component\'s\nconstitution + relevant self-model entries + the speaker\'s\nrelationship summary, plus a hemisphere-specific\n"you are the left/right hemisphere" preamble per pass.\n',
-    )
-    maxPasses: int | None = Field(
-        3,
-        description='Maximum number of bicameral passes before the orchestrator\nforces termination regardless of hemisphere disagreement.\n(v0.2) NT state may lower the effective cap below this\nvalue when cortisol / NE indicate Eugene should commit\nrather than deliberate further.\n',
-        ge=1,
-        le=10,
-    )
-    channelContext: list[ChannelContextEntry] | None = Field(
-        None,
-        description="(v0.2) For connector adapters bridging channel mentions\n(Discord channels, Slack channels, Matrix rooms): recent\nplatform messages preceding the mention, for\nconversational grounding. The orchestrator may surface\nthese to hemispheres as ambient context. NOT persisted\nto memory — privacy default protects people who didn't\ninvoke Eugene.\n",
-    )
-    source: MessageSource | None = Field(
-        None,
-        description='(v0.2) Where this message came from (platform / channel).\nDefaults to `{platform: ui, isDirectMessage: true}` when\nomitted (UI calls).\n',
-    )
-    requestId: UUID | None = Field(
-        None, description='Caller-supplied id for log correlation.'
-    )
-    incognito: bool | None = Field(
-        False,
-        description="(v0.2.1) Run this turn in incognito mode. When true:\n- Eugene's full identity loads (constitution + self-model)\n  — Eugene remains himself.\n- The speaker is treated as a stranger: no person lookup,\n  no relationship summary, no recent-turns retrieval from\n  memory.\n- Neither the user message nor Eugene's reply is persisted\n  to memory.\n- The running NT state is read for modulation but NOT\n  updated by this turn.\n- The conversation history for the turn comes from\n  `history` (below) instead of memory. Callers (typically\n  the UI) hold the incognito session's history client-side.\nUse for testing the inner-thought-process without identity\nand memory feedback loops, or for transient conversations\nan operator wants Eugene to forget.\n",
-    )
-    history: list[Message] | None = Field(
-        None,
-        description='(v0.2.1) Conversation history for this turn, supplied by\nthe caller. Honored only when `incognito` is true — in\nthat mode the orchestrator does not read memory, so the\ncaller must carry history forward. Ignored when\n`incognito` is false (the orchestrator loads history from\nmemory by `conversationId` as in v0.2).\n',
+    output: Message
+    latencyMs: int | None = Field(
+        None, description='Wall-clock duration of the voice pass call.', ge=0
     )
 
 
@@ -1382,20 +1519,3 @@ class PassRecord(BaseModel):
         min_length=0,
     )
     callosum: CallosumState
-
-
-class ChatResponse(BaseModel):
-    conversationId: UUID
-    message: Message
-    passes: list[PassRecord] = Field(
-        ...,
-        description='Per-pass record of what each driver said and how the corpus\ncallosum scored agreement. `passes[N].hemispheres` has one\nentry per configured driver that responded — two in v0.1.\n',
-    )
-    voicePass: VoicePassRecord | None = None
-    toolInvocations: list[ToolInvocationRecord] | None = Field(
-        None,
-        description="Ordered diagnostic record of every tool the orchestrator\ninvoked during this turn — afferent reads (memory recall,\nidentity), efferent writes (memory persistence), and internal\nregimented calls (NT observation). The primary debug surface\nfor the tool-calling substrate: the UI renders these alongside\nthe bicameral passes so an operator sees Eugene's\nperception/action flow, not just deliberation. Phase-1 tools\nare orchestrator-constructed (the model does not yet emit tool\ncalls); this trace shows what ran regardless. Optional —\norchestrators without the tool retrofit omit it.\n",
-    )
-    ntStateAtStart: NTState | None = None
-    ntStateAtEnd: NTState | None = None
-    requestId: UUID | None = None

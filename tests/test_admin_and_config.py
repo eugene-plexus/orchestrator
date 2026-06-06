@@ -6,7 +6,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.conftest import FakeHemisphereClient
+from tests.conftest import FakeHemisphereClient, make_message_event
 
 
 def test_admin_drivers_reports_list(
@@ -317,15 +317,18 @@ def test_config_patch_voicedriver_stays_lenient(client: TestClient) -> None:
     assert client.get("/v1/config").json()["voiceDriver"] == "not-a-slot"
 
 
-def test_chat_503_when_fewer_than_two_drivers(
+def test_events_503_when_fewer_than_two_drivers(
     app: FastAPI, left_fake: FakeHemisphereClient
 ) -> None:
     """v0.2.1 item 2: slot backends resolve against the watchdog topology
     at startup. If the topology was unreachable / missing the named
-    drivers, fewer than two slots get built — chat must 503 cleanly
-    rather than 500 deep in per-driver prompt assembly."""
+    drivers, fewer than two slots get built — POST /v1/events must 503
+    cleanly rather than enqueue an event the loop can't act on."""
     app.state.drivers = [left_fake]  # only one slot resolved
     with TestClient(app) as c:
-        response = c.post("/v1/chat", json={"message": "hi"})
+        response = c.post(
+            "/v1/events",
+            json=make_message_event("hi").model_dump(mode="json", exclude_none=True),
+        )
     assert response.status_code == 503
     assert "driver" in response.json()["detail"]["detail"].lower()

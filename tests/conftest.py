@@ -8,7 +8,9 @@ script of canned responses by mutating the fake clients on the app state.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -21,10 +23,21 @@ from eugene_plexus_orchestrator._generated.hemisphere_models import (
     GenerateRequest,
     GenerateResponse,
 )
+from eugene_plexus_orchestrator._generated.models import (
+    AfferentEvent,
+    IncomingMessage,
+    MessageSource,
+)
 from eugene_plexus_orchestrator.app import create_app
-from eugene_plexus_orchestrator.identity import InProcessIdentity
-from eugene_plexus_orchestrator.memory import InProcessMemory
+from eugene_plexus_orchestrator.bicameral.callosum import JaccardAgreementScorer
+from eugene_plexus_orchestrator.bicameral.nt import neutral_state
+from eugene_plexus_orchestrator.config import ConfigStore
+from eugene_plexus_orchestrator.identity import IdentityClient, InProcessIdentity
+from eugene_plexus_orchestrator.memory import NIL_PERSON_ID, InProcessMemory, MemoryClient
+from eugene_plexus_orchestrator.runtime.loop import ConsciousnessLoop
+from eugene_plexus_orchestrator.runtime.stream import ConsciousnessBroker
 from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_orchestrator.tools import build_tool_runner
 
 
 class FakeHemisphereClient:
@@ -129,3 +142,82 @@ def in_process_identity() -> InProcessIdentity:
 def client(app: FastAPI) -> Iterator[TestClient]:
     with TestClient(app) as c:
         yield c
+
+
+# --------------------------------------------------------------------------- #
+# Continuous-loop test helpers
+#
+# The loop is exercised by `await`ing `_handle_message` directly on a fresh
+# `ConsciousnessLoop` over a fully-populated `app.state` — fast, and it
+# sidesteps the friction between the sync TestClient and the async
+# fire-and-forget loop. (`asyncio_mode = "auto"`, so `async def test_*`
+# just works.)
+# --------------------------------------------------------------------------- #
+
+
+def build_loop_app(
+    settings: Settings,
+    drivers: list[FakeHemisphereClient],
+    *,
+    memory: MemoryClient | None = None,
+    identity: IdentityClient | None = None,
+) -> FastAPI:
+    """An app with all of `app.state` populated for direct loop testing.
+
+    Mirrors the non-loop parts of the lifespan (config, NT, scorer, tool
+    runner) so a test can construct a `ConsciousnessLoop` and `await`
+    `_handle_message` without running the lifespan or a TestClient.
+    """
+    app = create_app(settings=settings)
+    store = ConfigStore(settings.config_file)
+    store.load()
+    app.state.config_store = store
+    app.state.safe_mode = False
+    app.state.nt_state = neutral_state()
+    app.state.drivers = list(drivers)
+    app.state.memory = memory if memory is not None else InProcessMemory()
+    app.state.memory_url = "in-process"
+    app.state.identity = identity
+    app.state.identity_url = "in-process" if identity is not None else ""
+    app.state.scorer = JaccardAgreementScorer()
+    app.state.tool_runner = build_tool_runner(memory=app.state.memory, identity=identity)
+    return app
+
+
+def make_message_event(
+    content: str,
+    *,
+    person_id: UUID = NIL_PERSON_ID,
+    conversation_id: UUID | None = None,
+    platform: str = "ui",
+) -> AfferentEvent:
+    """Build a `kind=message` AfferentEvent for the loop."""
+    source = MessageSource(platform=platform)
+    return AfferentEvent(
+        eventId=uuid4(),
+        kind="message",
+        source=source,
+        timestamp=datetime.now(UTC),
+        message=IncomingMessage(
+            personId=person_id,
+            content=content,
+            conversationId=conversation_id,
+            source=source,
+        ),
+    )
+
+
+async def drive_message(app: FastAPI, event: AfferentEvent) -> list[tuple[str, dict]]:
+    """Run one message through a fresh loop on `app`; return published events.
+
+    Each element is `(event_type, data)` — the consciousness-stream events
+    the loop emitted for this turn, in order.
+    """
+    broker = ConsciousnessBroker()
+    loop = ConsciousnessLoop(app, broker)
+    queue = broker.subscribe()
+    await loop._handle_message(event)
+    events: list[tuple[str, dict]] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return events

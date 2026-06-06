@@ -21,10 +21,13 @@ from .hemisphere_client import FailoverHemisphereClient, HemisphereClient, HttpH
 from .identity import HttpIdentity, IdentityClient
 from .memory import HttpMemory, MemoryClient
 from .routes import admin as admin_routes
-from .routes import chat as chat_routes
 from .routes import config as config_routes
 from .routes import conversations as conversations_routes
+from .routes import events as events_routes
 from .routes import health as health_routes
+from .routes import stream as stream_routes
+from .runtime.loop import ConsciousnessLoop
+from .runtime.stream import ConsciousnessBroker
 from .settings import Settings, load_settings
 from .tools import build_tool_runner
 
@@ -365,9 +368,25 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             identity=getattr(app.state, "identity", None),
         )
 
+    # The continuous consciousness loop — Eugene's single cognitive task.
+    # Built after all of app.state is in place (drivers, memory, identity,
+    # scorer, tools, NT) and started here; the HTTP endpoints inject
+    # afferent events onto its queue and subscribe to its observability
+    # stream. Always built (even in safe mode) so the wiring is uniform —
+    # it simply has nothing to think with until drivers resolve, and
+    # POST /v1/events returns 503 in the meantime.
+    if not hasattr(app.state, "broker"):
+        app.state.broker = ConsciousnessBroker()
+    if not hasattr(app.state, "loop"):
+        app.state.loop = ConsciousnessLoop(app, app.state.broker)
+    app.state.event_queue = app.state.loop.queue
+    app.state.loop.start()
+
     try:
         yield
     finally:
+        # Stop cognition before tearing down the clients it depends on.
+        await app.state.loop.stop()
         if owns_memory:
             await app.state.memory.aclose()
         if owns_identity and app.state.identity is not None:
@@ -383,7 +402,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Eugene Plexus — orchestrator",
-        description="Bicameral chat orchestrator.",
+        description="Continuous-loop consciousness orchestrator.",
         version=__version__,
         lifespan=_lifespan,
     )
@@ -409,6 +428,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # — e.g. connector → orchestrator when a Discord message comes in).
     authorized = [Depends(require_authorized)]
     app.include_router(conversations_routes.router, dependencies=authorized)
-    app.include_router(chat_routes.router, dependencies=authorized)
+    app.include_router(events_routes.router, dependencies=authorized)
+    app.include_router(stream_routes.router, dependencies=authorized)
 
     return app

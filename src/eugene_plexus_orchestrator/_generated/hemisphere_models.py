@@ -895,6 +895,99 @@ class RestartResult(BaseModel):
     )
 
 
+class Kind(StrEnum):
+    """
+    Discriminates the payload. Extensible — future afferent
+    modalities (timer, sensor, …) add an enum value + a payload
+    field without changing the envelope.
+
+    """
+
+    message = 'message'
+    presence = 'presence'
+
+
+class Change(StrEnum):
+    """
+    The occupancy transition observed.
+    """
+
+    entered = 'entered'
+    left = 'left'
+
+
+class PresenceEvent(BaseModel):
+    """
+    Afferent perception of the social environment's *occupancy* —
+    who entered or left an environment — distinct from message
+    content. This is the external trigger that lets Eugene
+    *initiate* (not just respond): the continuous loop + speak-as-a-
+    decision give the ability to start talking; presence gives the
+    social cue to.
+
+    Presence is a LOSSY, NT-modulated salience signal, NOT a queue:
+    most occupancy churn is low-salience and never attended (the
+    loop drops it), the same way a person doesn't consciously track
+    everyone's comings and goings. Salience is gated by NT state —
+    wary attends to strangers, relaxed attends to known persons.
+    Restraint about acting on presence is *learned*, not a policy
+    knob.
+
+    Actor resolution ties into identity: an enter/leave resolves to
+    a `personId` when known, otherwise to a `PlatformAlias` / the
+    pending-link flow. "X entered" only means something once X is a
+    known person.
+
+    """
+
+    change: Change = Field(..., description='The occupancy transition observed.')
+    environment: MessageSource = Field(
+        ...,
+        description='The environment (platform / channel) whose occupancy\nchanged. Reuses `MessageSource` addressing.\n',
+    )
+    personId: UUID | None = Field(
+        None,
+        description='The actor, resolved to a known person. Omitted when the\nactor is unknown — see `alias`.\n',
+    )
+    alias: PlatformAlias | None = Field(
+        None,
+        description='Set instead of `personId` when the actor is an unrecognized\nplatform user (routes to the pending-link flow rather than\nto relationship-aware behavior).\n',
+    )
+
+
+class EfferentSpeechAct(BaseModel):
+    """
+    An efferent (act-out) utterance Eugene has *decided* to emit.
+    Speech is not a privileged terminal step — it is an efferent
+    action the gate elects when speaking has higher anticipated
+    reward than continuing to think or staying silent. Silence is a
+    valid outcome and simply produces no `EfferentSpeechAct`.
+
+    Routed to a destination by the speak effector: a reply in a
+    Discord channel goes to the connector's outbound API for that
+    channel; a reply in the UI goes to the UI's speech stream;
+    *initiated* speech (no triggering event) picks its destination
+    from social context. `destination` reuses `MessageSource`
+    addressing — the mirror of an `AfferentEvent.source`.
+
+    """
+
+    destination: MessageSource = Field(
+        ...,
+        description='Where the utterance is delivered (mirror of afferent `source`).',
+    )
+    content: str
+    inResponseTo: UUID | None = Field(
+        None,
+        description='The `AfferentEvent.eventId` this utterance reacts to, when\nreactive. Omitted for self-initiated speech (mind-wandering,\npresence-triggered) — Eugene speaking on its own initiative,\nnot in reply to a specific event.\n',
+    )
+    conversationId: UUID | None = Field(
+        None,
+        description='Conversation thread the utterance belongs to, when applicable.',
+    )
+    timestamp: AwareDatetime
+
+
 class FinishReason(StrEnum):
     stop = 'stop'
     length = 'length'
@@ -1202,15 +1295,16 @@ class RelationshipSummary(BaseModel):
 class IncomingMessage(BaseModel):
     """
     Normalized message shape an adapter posts to the
-    orchestrator's `POST /v1/chat`. Adapter-specific platform
-    details collapse to this universal shape; the orchestrator
-    never sees Discord-specific or Slack-specific fields.
+    orchestrator, wrapped in an `AfferentEvent` (`kind: message`)
+    to `POST /v1/events`. Adapter-specific platform details
+    collapse to this universal shape; the orchestrator never sees
+    Discord-specific or Slack-specific fields.
 
     """
 
     personId: UUID = Field(
         ...,
-        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not call `/v1/chat` — Eugene only responds to\nknown people.\n",
+        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not post the event — Eugene only responds to\nknown people.\n",
     )
     conversationId: UUID | None = Field(
         None,
@@ -1221,6 +1315,47 @@ class IncomingMessage(BaseModel):
     channelContext: list[ChannelContextEntry] | None = Field(
         None,
         description="For channel-mention adapters (Discord channel\nmentions, Slack channels): recent platform messages\npreceding the mention, included for conversational\ngrounding. The orchestrator may surface these to\nhemispheres as ambient context, but only the actual\nmention/reply gets persisted to memory (privacy\ndefault: don't store messages from people who didn't\ninvoke Eugene).\n",
+    )
+
+
+class AfferentEvent(BaseModel):
+    """
+    A single afferent (perception-in) event injected into the
+    orchestrator's continuous loop via `POST /v1/events`. The
+    unified envelope for everything Eugene perceives — a person's
+    message, a presence change, and future sensory inputs all arrive
+    as one shape, differing only by `kind` and the typed payload.
+
+    Injection is fire-and-forget: the endpoint enqueues the event
+    and returns `202` immediately. Whether, when, and how Eugene
+    responds is the loop's decision, not this call's — there is no
+    synchronous reply (the request-response `/v1/chat` surface was
+    removed). Speech leaves asynchronously; see `EfferentSpeechAct`
+    and `GET /v1/stream/consciousness`.
+
+    An unsolicited event arriving keeps `role: user` semantics —
+    Eugene did not "call hear." Only Eugene's *interpretation* of it
+    (and any solicited perception) is an afferent tool cycle.
+
+    """
+
+    eventId: UUID = Field(
+        ...,
+        description="Caller-minted id. Echoed by any resulting `EfferentSpeechAct`\nin `inResponseTo` when Eugene's reply is reactive to this\nevent, for correlation.\n",
+    )
+    kind: Kind = Field(
+        ...,
+        description='Discriminates the payload. Extensible — future afferent\nmodalities (timer, sensor, …) add an enum value + a payload\nfield without changing the envelope.\n',
+    )
+    source: MessageSource = Field(
+        ..., description='Where the event came from (platform / channel).'
+    )
+    timestamp: AwareDatetime
+    message: IncomingMessage | None = Field(
+        None, description='Present when `kind` is `message`.'
+    )
+    presence: PresenceEvent | None = Field(
+        None, description='Present when `kind` is `presence`.'
     )
 
 

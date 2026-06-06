@@ -30,7 +30,7 @@ from eugene_plexus_orchestrator.app import create_app
 from eugene_plexus_orchestrator.auth_state import AuthState
 from eugene_plexus_orchestrator.memory import InProcessMemory
 from eugene_plexus_orchestrator.settings import Settings
-from tests.conftest import FakeHemisphereClient
+from tests.conftest import FakeHemisphereClient, make_message_event
 
 _JWT_ALG = "HS256"
 
@@ -189,20 +189,16 @@ def test_operator_token_accepted_on_admin(authed_client: TestClient, operator_to
     assert response.status_code == 200
 
 
-def test_operator_token_accepted_on_chat(
+def test_operator_token_accepted_on_events(
     authed_client: TestClient,
     operator_token: str,
-    left_fake: FakeHemisphereClient,
-    right_fake: FakeHemisphereClient,
 ) -> None:
-    left_fake.responses = ["hello"]
-    right_fake.responses = ["hello"]
     response = authed_client.post(
-        "/v1/chat",
-        json={"message": "hi"},
+        "/v1/events",
+        json=make_message_event("hi").model_dump(mode="json", exclude_none=True),
         headers={"Authorization": f"Bearer {operator_token}"},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
 
 
 # --------------------------------------------------------------------------- #
@@ -230,48 +226,34 @@ def test_service_token_rejected_on_admin_restart(
     assert response.status_code == 401
 
 
-def test_service_token_accepted_on_chat(
+def test_service_token_accepted_on_events(
     authed_client: TestClient,
     service_token: str,
-    left_fake: FakeHemisphereClient,
-    right_fake: FakeHemisphereClient,
 ) -> None:
-    """Peer components (e.g. a future connector calling /v1/chat when a
+    """Peer components (e.g. the connector injecting an event when a
     Discord message arrives) authenticate with a service-audience token."""
-    left_fake.responses = ["pong"]
-    right_fake.responses = ["pong"]
     response = authed_client.post(
-        "/v1/chat",
-        json={"message": "ping"},
+        "/v1/events",
+        json=make_message_event("ping").model_dump(mode="json", exclude_none=True),
         headers={"Authorization": f"Bearer {service_token}"},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
 
 
 def test_service_token_accepted_on_conversation_read(
     authed_client: TestClient,
-    operator_token: str,
     service_token: str,
-    left_fake: FakeHemisphereClient,
-    right_fake: FakeHemisphereClient,
 ) -> None:
-    """Cross-token flow: operator creates a conversation, service token
-    can read it back. Both audiences are accepted on /v1/conversations."""
-    left_fake.responses = ["start"]
-    right_fake.responses = ["start"]
-    chat = authed_client.post(
-        "/v1/chat",
-        json={"message": "open"},
-        headers={"Authorization": f"Bearer {operator_token}"},
-    )
-    assert chat.status_code == 200
-    cid = chat.json()["conversationId"]
+    """Both audiences are accepted on /v1/conversations. A service-token
+    read of an unknown conversation passes auth (404), not 401 — which is
+    what proves the token was accepted."""
+    from uuid import uuid4
 
     read = authed_client.get(
-        f"/v1/conversations/{cid}",
+        f"/v1/conversations/{uuid4()}",
         headers={"Authorization": f"Bearer {service_token}"},
     )
-    assert read.status_code == 200
+    assert read.status_code == 404, read.text  # auth passed; conversation absent
 
 
 # --------------------------------------------------------------------------- #
