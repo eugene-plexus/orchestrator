@@ -4,7 +4,10 @@ Verify (translated from the v0.2 `POST /v1/chat` round-trips):
   - NT state evolves on the turn and is emitted on the consciousness
     stream as an `nt_update` event (the live evolution of v0.2's
     `ChatResponse.ntStateAtEnd`).
-  - Quick single-pass convergence moves GABA + dopamine up.
+  - A settled (high-agreement) turn moves GABA + dopamine up. The impulse
+    map keys "calm" on whether the bout SETTLED (final agreement ≥
+    threshold), not on pass count — under the plateau-stop a clean
+    convergence is no longer synonymous with "exactly one pass."
   - Low per-pass latency pulls norepinephrine down.
   - NT state evolves across turns on the same app — it is mutated in
     place, not reset per message (the live evolution of v0.2's
@@ -12,9 +15,9 @@ Verify (translated from the v0.2 `POST /v1/chat` round-trips):
     which just returns `app.state.nt_state`).
 
 DROPPED: `test_high_cortisol_widens_modulated_max_passes` — NT no longer
-modulates the pass count (the loop runs to the configured `defaultMaxPasses`;
-`modulated_max_passes` is no longer wired into the turn). It survives as a
-pure function in `bicameral/nt.py` and is unit-tested there.
+modulates the pass count (deliberation depth is owned by the plateau-stop
+gate; `modulated_max_passes` was deleted, since a count is the kind of
+arbitrary cognitive limit the design forbids).
 """
 
 from __future__ import annotations
@@ -37,12 +40,14 @@ async def test_turn_emits_nt_update_with_convergence_directions(
     left_fake: FakeHemisphereClient,
     right_fake: FakeHemisphereClient,
 ) -> None:
-    """A single agreeing turn evolves NT and publishes the new state on the
-    stream so the UI can render Eugene's cognitive arc per turn. Quick
-    single-pass convergence → GABA up, dopamine up."""
-    # Identical "hi"/"hi" → Jaccard agreement 1.0 → one pass; left is the
-    # voice driver so it generates once more ("hi voice").
-    left_fake.responses = ["hi", "hi voice"]
+    """A settled turn evolves NT and publishes the new state on the stream
+    so the UI can render Eugene's cognitive arc per turn → GABA up,
+    dopamine up."""
+    # Both hemispheres say the same thing every pass — the fake repeats its
+    # last response once its script drains, so agreement stays 1.0 across
+    # however many passes the plateau gate runs (and the voice pass reuses
+    # it too). A settled bout → GABA up, dopamine up.
+    left_fake.responses = ["hi"]
     right_fake.responses = ["hi"]
     app = build_loop_app(settings, [left_fake, right_fake])
 
@@ -90,8 +95,10 @@ async def test_nt_state_evolves_across_turns_on_same_app(
     """NT state is carried on app.state and mutated in place, not reset per
     message. After two consecutive agreeing turns the live state still
     reflects accumulated convergence and `lastUpdated` advanced."""
-    left_fake.responses = ["hi", "hi voice", "hi", "hi voice"]
-    right_fake.responses = ["hi", "hi"]
+    # Repeat-last keeps every pass (and the voice pass) at "hi" across both
+    # turns, so each turn settles regardless of how many passes the gate runs.
+    left_fake.responses = ["hi"]
+    right_fake.responses = ["hi"]
     app = build_loop_app(settings, [left_fake, right_fake])
 
     await drive_message(app, make_message_event("first"))

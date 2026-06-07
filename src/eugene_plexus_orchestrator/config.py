@@ -34,6 +34,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "network": "Network",
     "logging": "Logging",
     "bicameral": "Bicameral Loop",
+    "gate": "Action Gate (NT-driven)",
     "generation": "Generation Defaults (NT-modulated in v0.2+)",
     "persona": "Persona",
 }
@@ -214,43 +215,134 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="defaultMaxPasses",
-        label="Default max passes",
+        label="Max passes (runaway cost fuse)",
         description=(
-            "Hard cap on how many times the orchestrator will re-prompt "
-            "the hemispheres before giving up and returning a blended "
-            'response anyway. Each "pass" sends the conversation to '
-            "every driver in parallel and scores how much they agree; "
-            "if they disagree, another pass runs. Higher values give "
-            "the system more chances to converge on a unified answer at "
-            "the cost of latency and tokens. The chat request can "
-            "override this per-call."
+            "Runaway cost fuse — NOT a deliberation target. A healthy "
+            "bout ends on a dopamine plateau (see the Action Gate "
+            "settings) well before this; the fuse only bounds tokens / "
+            "latency in the pathological case where the plateau never "
+            "fires. If you see bouts ending at this cap (a `cap_reached` "
+            "decision / WARN in the logs) on normal turns, the plateau "
+            "knobs are mis-tuned — fix those rather than raising this. "
+            'Each "pass" sends the conversation to every driver in '
+            "parallel and scores how much they agree."
         ),
         category="bicameral",
         valueType=ConfigValueType.integer,
-        default=3,
+        default=8,
         minimum=1,
         maximum=10,
     ),
     ConfigField(
         key="agreementThreshold",
-        label="Agreement threshold",
+        label="Agreement threshold (reward + voice register)",
         description=(
-            "How much semantic agreement two driver responses need "
-            'before the orchestrator considers them "in agreement" '
-            "and stops looping. v0.2.x scores by cosine similarity of "
-            "sentence-transformer embeddings — picks up paraphrases "
-            "that mean the same thing in different words. 0.0 is no "
-            "agreement, 1.0 is identical text. Practical scale on the "
-            "default model: ~0.4 same topic / different point, ~0.75 "
-            "substantively agree, ~0.9+ near-identical paraphrase. "
-            "Lower values terminate the loop sooner; higher demand "
-            "near-identical answers."
+            "The agreement level that counts as the hemispheres having "
+            '"settled." NOTE: this no longer terminates the loop — the '
+            "plateau-stop gate decides when deliberation ends. This "
+            "value now only (a) centers the post-turn dopamine reward "
+            "(converging above it feels good, below it doesn't) and "
+            "(b) feeds the calm-vs-stress NT impulse. v0.2.x scores by "
+            "cosine similarity of sentence-transformer embeddings. "
+            "Practical scale on the default model: ~0.4 same topic / "
+            "different point, ~0.75 substantively agree, ~0.9+ near-"
+            "identical paraphrase."
         ),
         category="bicameral",
         valueType=ConfigValueType.number,
         default=0.75,
         minimum=0.0,
         maximum=1.0,
+    ),
+    # -- Action gate: the noisy dopamine-plateau that ends a think-bout.
+    # These shape a drift-diffusion accumulator (gain / noise knobs), not
+    # stop rules — there is no "stop after N passes" or "stop when the
+    # agreement slope drops below X" cutoff anywhere. See bicameral/plateau.py.
+    ConfigField(
+        key="plateauBaseDrift",
+        label="Plateau base drift",
+        description=(
+            "How hard the bout drifts toward stopping each pass when "
+            "thinking has stopped improving — the resting urge to "
+            "commit. Mean passes-to-stop is roughly 1 / this value, so "
+            "higher = Eugene commits sooner, lower = it lingers. This is "
+            "the main 'how deliberate is Eugene' dial. Keep it above "
+            "~(1 / max-passes fuse) or the plateau can't fire before the "
+            "fuse and every bout ends as cap_reached."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=1.0,
+        minimum=0.2,
+        maximum=5.0,
+    ),
+    ConfigField(
+        key="plateauRpeGain",
+        label="Plateau improvement gain",
+        description=(
+            "How strongly a refining thought (rising cross-hemisphere "
+            "agreement, pass over pass) buys another pass. Higher = "
+            "Eugene chases marginal improvements harder before "
+            "committing; 0 = improvement is ignored and the bout ends "
+            "purely on the base drift. The default is well above the "
+            "base drift so a realistic per-pass improvement (~0.1-0.3) "
+            "cancels most of the resting drift and a genuinely-converging "
+            "bout runs several passes longer than a flat one."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=3.0,
+        minimum=0.0,
+        maximum=10.0,
+    ),
+    ConfigField(
+        key="plateauValenceGain",
+        label="Plateau valence gain",
+        description=(
+            "How strongly Eugene's mood (net NT valence) biases bout "
+            "length. Positive valence (good-feeling state) lingers; "
+            "negative valence (e.g. high cortisol / stress) commits "
+            "sooner. Set NEGATIVE to invert that — stress makes Eugene "
+            "ruminate longer instead of wrapping up. 0 = mood doesn't "
+            "affect deliberation length."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=0.5,
+        minimum=-2.0,
+        maximum=2.0,
+    ),
+    ConfigField(
+        key="plateauNoiseSigma",
+        label="Plateau noise",
+        description=(
+            "Std-dev of the Gaussian noise on the plateau accumulator — "
+            "the brain-like stochasticity that makes WHEN Eugene stops "
+            "thinking non-deterministic (near a marginal plateau, two "
+            "identical situations can stop a pass apart). 0 = fully "
+            "deterministic given the inputs. Keep this low relative to "
+            "the base drift."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=0.1,
+        minimum=0.0,
+        maximum=1.0,
+    ),
+    ConfigField(
+        key="plateauSeed",
+        label="Plateau RNG seed (debug)",
+        description=(
+            "Optional fixed seed for the plateau accumulator's noise. "
+            "Leave blank in normal operation — Eugene then draws fresh "
+            "entropy each bout (real stochasticity). Set an integer only "
+            "to make the noisy stop reproducible for debugging or for "
+            "clamp-and-sample characterization runs."
+        ),
+        category="gate",
+        valueType=ConfigValueType.integer,
+        default=None,
+        required=False,
     ),
     ConfigField(
         key="crossPassFraming",

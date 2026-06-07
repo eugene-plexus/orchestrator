@@ -11,8 +11,8 @@ import pytest
 from eugene_plexus_orchestrator._generated.models import NTLevel, NTState
 from eugene_plexus_orchestrator.bicameral.nt import (
     Observations,
-    modulated_max_passes,
     modulated_temperature,
+    net_valence,
     neutral_state,
     tick,
 )
@@ -142,31 +142,45 @@ def _state_with(**levels: float) -> NTState:
     return base.model_copy(update=update)
 
 
-def test_modulated_max_passes_at_neutral_equals_base() -> None:
-    assert modulated_max_passes(neutral_state(), 3) == 3
+def test_net_valence_at_neutral_is_exactly_zero() -> None:
+    # Every level == baseline (0.5) → no deviation → zero felt valence.
+    assert net_valence(neutral_state()) == 0.0
 
 
-def test_modulated_max_passes_adds_passes_for_high_cortisol() -> None:
-    anxious = _state_with(cortisol=1.0)
-    assert modulated_max_passes(anxious, 3) == 5  # base + 2 cortisol_boost
+def test_net_valence_dopamine_is_appetitive() -> None:
+    # dopamine weight +1.0; level 1.0 is +0.5 above baseline → +0.5.
+    assert net_valence(_state_with(dopamine=1.0)) == pytest.approx(0.5)
 
 
-def test_modulated_max_passes_adds_one_for_high_norepinephrine() -> None:
-    alert = _state_with(norepinephrine=1.0)
-    assert modulated_max_passes(alert, 3) == 4  # base + 1 ne_boost
+def test_net_valence_cortisol_is_aversive() -> None:
+    # cortisol weight -0.8; +0.5 deviation → -0.4. Stress feels bad.
+    assert net_valence(_state_with(cortisol=1.0)) == pytest.approx(-0.4)
 
 
-def test_modulated_max_passes_capped_at_ten_to_prevent_runaway() -> None:
-    extreme = _state_with(cortisol=1.0, norepinephrine=1.0)
-    # base 9 + 3 = 12, but the hard cap is 10.
-    assert modulated_max_passes(extreme, 9) == 10
+def test_net_valence_norepinephrine_is_mildly_aversive() -> None:
+    # NE weight -0.3; +0.5 deviation → -0.15. Arousal/effort is a cost.
+    assert net_valence(_state_with(norepinephrine=1.0)) == pytest.approx(-0.15)
 
 
-def test_modulated_max_passes_never_falls_below_base_at_low_cortisol() -> None:
-    """Below-baseline cortisol does NOT subtract passes — asymmetric by
-    design so calm Eugene still gets the operator's configured ceiling."""
-    calm = _state_with(cortisol=0.0, norepinephrine=0.0)
-    assert modulated_max_passes(calm, 3) == 3
+def test_net_valence_gaba_is_mildly_appetitive() -> None:
+    # GABA weight +0.4; +0.5 deviation → +0.2. Calm is mildly pleasant.
+    assert net_valence(_state_with(gaba=1.0)) == pytest.approx(0.2)
+
+
+def test_net_valence_ignores_decay_only_nts() -> None:
+    # serotonin + acetylcholine carry weight 0.0 in v0.2 (they never leave
+    # baseline), so sweeping them must not move valence.
+    assert net_valence(_state_with(serotonin=1.0, acetylcholine=0.0)) == pytest.approx(0.0)
+    assert net_valence(_state_with(serotonin=0.0, acetylcholine=1.0)) == pytest.approx(0.0)
+
+
+def test_net_valence_combines_signs() -> None:
+    # High dopamine + low cortisol → strongly positive; the reverse → negative.
+    good = _state_with(dopamine=1.0, cortisol=0.0)  # +0.5 + (-0.8 * -0.5) = +0.9
+    bad = _state_with(dopamine=0.0, cortisol=1.0)  # -0.5 + (-0.8 * +0.5) = -0.9
+    assert net_valence(good) == pytest.approx(0.9)
+    assert net_valence(bad) == pytest.approx(-0.9)
+    assert net_valence(good) > net_valence(bad)
 
 
 def test_modulated_temperature_at_neutral_equals_base() -> None:

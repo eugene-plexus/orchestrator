@@ -1,24 +1,36 @@
-"""Neurotransmitter state — evolution and bicameral-loop modulation.
+"""Neurotransmitter state — evolution, valence, and bicameral modulation.
 
 The NT system tracks six neurotransmitters as `{level, baseline, decay}`
 triples. Between chat turns the level decays exponentially toward
-baseline. Each turn's `Observations` apply impulses to specific NTs,
-and the new levels modulate the next turn's bicameral parameters:
+baseline. Each turn's `Observations` apply impulses to specific NTs.
+The live levels then feed two consumers:
 
-  - **max_passes** = f(cortisol, norepinephrine) — anxious / alert
-    Eugene allows more deliberation; calm Eugene commits sooner.
+  - **net_valence(state)** = the signed scalar "how good does this state
+    feel" — dopamine/GABA appetitive, cortisol/NE aversive. This is the
+    reward axis the action gate hill-climbs ("behavior = pursuit of
+    anticipated net NT valence") and the per-pass brake the plateau-stop
+    accumulator reads (see `bicameral/plateau.py`).
   - **temperature** = f(dopamine, GABA) — dopamine pushes toward
     exploration / creativity; GABA pulls toward determinism.
 
-Observation → NT impulse map (locked v0.2):
+(The old `max_passes = f(cortisol, NE)` modulation is gone: a count is an
+arbitrary cognitive limit, and deliberation depth is now owned by the
+improvement-driven plateau-stop. Pressure is applied through NT dynamics +
+noise, not by adding passes.)
 
-  - high agreement on the final pass → dopamine up
-  - low agreement / multiple passes → cortisol up
-  - quick single-pass convergence → GABA up
+Observation → NT impulse map:
+
+  - high final agreement → dopamine up (reward for converging well)
+  - the bout settled (final agreement ≥ threshold) → GABA up (calm)
+  - the bout did NOT settle → cortisol up, scaled by passes spent (stress)
   - long average pass latency → norepinephrine up
   - acetylcholine (novelty / attention) and serotonin (mood / steady
     state) accumulate from baseline decay only in v0.2 — the topic-
     shift detector that would drive ACh lands in v0.3.
+
+Note the impulse map keys "calm vs stress" on *whether the bout settled*
+(final agreement), NOT on pass count: under the plateau-stop a clean
+convergence is no longer synonymous with "exactly one pass."
 
 State persistence: in-memory only. A restart resets to neutral state,
 matching the "Eugene cools down after a reboot" anatomy.
@@ -118,20 +130,21 @@ def _impulses_from_observations(obs: Observations) -> _Impulse:
     above_threshold = obs.final_agreement - obs.agreement_threshold
     dopamine = max(-0.3, min(0.3, above_threshold * 0.6))
 
-    # Pass count → cortisol / GABA.
-    # Quick convergence (1 pass with agreement above threshold) = GABA up.
-    # Multi-pass with divergence = cortisol up.
-    if obs.pass_count == 1 and obs.final_agreement >= obs.agreement_threshold:
+    # Did the bout SETTLE? → cortisol / GABA. Keyed on the outcome
+    # quality (final agreement vs threshold), NOT on pass count: under
+    # the plateau-stop a clean convergence is no longer "exactly one
+    # pass," so pass count alone no longer distinguishes calm from
+    # struggle. A bout that settled is calming (GABA up); one that ran
+    # without settling is stressful (cortisol up), and the stress scales
+    # with how many passes were spent failing to settle.
+    if obs.final_agreement >= obs.agreement_threshold:
         gaba = 0.15
         cortisol = -0.05  # mild relaxation
-    elif obs.pass_count >= 2:
-        # Each additional pass adds cortisol stress, saturating at
-        # +0.3 by ~5 passes.
-        cortisol = min(0.3, (obs.pass_count - 1) * 0.08)
-        gaba = -0.05
     else:
-        gaba = 0.0
-        cortisol = 0.0
+        # Each pass spent without settling adds cortisol stress,
+        # saturating at +0.3.
+        cortisol = min(0.3, max(0, obs.pass_count - 1) * 0.08)
+        gaba = -0.05
 
     # Latency → norepinephrine. Long latency = pay-attention nudge.
     norm_latency = min(1.0, obs.avg_pass_latency_ms / _LATENCY_SATURATION_MS)
@@ -196,38 +209,58 @@ def tick(
     )
 
 
+# -------- Net affective valence --------
+#
+# The signed scalar "how good does the current internal state feel."
+# This is the v0.2 reward primitive — the axis the action gate hill-
+# climbs ("behavior = pursuit of anticipated net NT valence") and the
+# brake the plateau-stop accumulator reads. Valence is measured as a
+# *deviation from baseline*, so a fully-neutral Eugene (every level at
+# its baseline) has net_valence == 0.0 exactly: a clean zero reference.
+#
+# Per-NT sign + weight. These are a SIGN CONVENTION (what valence IS),
+# not operator-tunable behavioral knobs: exposing them would let a
+# config edit invert Eugene's reward sign, which is a footgun, not a
+# feature. Only the four NTs that actually receive impulses in v0.2
+# carry weight; serotonin/acetylcholine are decay-only (they never leave
+# baseline), so their contribution is 0 today — the entries are present
+# so wiring their impulses in v0.3 is a weight edit, not a signature
+# change.
+_VALENCE_WEIGHTS: dict[str, float] = {
+    "dopamine": +1.0,  # appetitive — the reward/wanting signal; dominant term
+    "gaba": +0.4,  # calm / settledness — mildly pleasant
+    "cortisol": -0.8,  # stress / unresolved tension — aversive
+    "norepinephrine": -0.3,  # arousal / effort cost — mildly aversive at load
+    "serotonin": 0.0,  # decay-only in v0.2 → no valence contribution yet
+    "acetylcholine": 0.0,  # decay-only in v0.2 → no valence contribution yet
+}
+
+
+def net_valence(state: NTState) -> float:
+    """Signed hedonic tone of an NTState, roughly in [-1, +1].
+
+    Sum over the active NTs of `(level - baseline) * weight`. Positive =
+    appetitive (feels good to keep doing this), negative = aversive.
+    Neutral state (every level == baseline) returns exactly 0.0.
+
+    Pure function of the NT state — sibling to `modulated_temperature`.
+    Reused by the plateau-stop gate and (later) the action-selection
+    gate; surfaced on `GateDecision.anticipatedValence`.
+    """
+    total = 0.0
+    for name, weight in _VALENCE_WEIGHTS.items():
+        if weight == 0.0:
+            continue
+        level: NTLevel = getattr(state, name)
+        total += weight * (level.level - level.baseline)
+    return total
+
+
 # -------- Bicameral parameter modulation --------
 #
-# Both modulators return a plain Python value the bicameral loop /
-# orchestrator config can consume. They're pure functions of the NT
-# state + the configured baseline, so the chat handler can pre-compute
-# values once per turn and pass them to the loop unchanged.
-
-
-# Hard ceiling on max_passes regardless of NT bias — matches the
-# `defaultMaxPasses` config field's max=10. Keeps a runaway-anxiety
-# state from blocking forever.
-_HARD_MAX_PASSES = 10
-
-
-def modulated_max_passes(state: NTState, base_max_passes: int) -> int:
-    """`max_passes = base + cortisol_boost + ne_boost`.
-
-    At neutral NT (every level 0.5), returns `base_max_passes`. As
-    cortisol or NE rise above baseline, more deliberation is allowed.
-    Capped at `_HARD_MAX_PASSES`.
-
-    Below-baseline cortisol does NOT subtract passes — Eugene at peace
-    still gets the operator's configured ceiling. The asymmetry is
-    deliberate: anxious Eugene deliberates longer than calm Eugene,
-    but calm Eugene doesn't undershoot the operator's intent.
-    """
-    cortisol = state.cortisol.level
-    ne = state.norepinephrine.level
-    cortisol_boost = max(0, round((cortisol - 0.5) * 4))  # 0..2 over [.5, 1]
-    ne_boost = max(0, round((ne - 0.5) * 2))  # 0..1 over [.5, 1]
-    boosted = base_max_passes + cortisol_boost + ne_boost
-    return max(1, min(_HARD_MAX_PASSES, boosted))
+# `modulated_temperature` returns a plain value the bicameral loop
+# consumes. Pure function of the NT state + the configured baseline, so
+# the loop pre-computes it once per turn and passes it down unchanged.
 
 
 def modulated_temperature(state: NTState, base_temperature: float | None) -> float | None:

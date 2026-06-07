@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 from datetime import UTC, datetime
 
 import httpx
@@ -40,7 +41,8 @@ from .._generated.models import (
     Role,
 )
 from ..bicameral.loop import run_bicameral_loop
-from ..bicameral.nt import modulated_temperature
+from ..bicameral.nt import modulated_temperature, net_valence
+from ..bicameral.plateau import BoutGate, PlateauParams
 from ..bicameral.voice import run_voice_pass
 from ..hemisphere_client import HemisphereClient, HemisphereDriverError
 from ..memory import NIL_PERSON_ID, MemoryClient
@@ -281,15 +283,21 @@ class ConsciousnessLoop:
             return
 
         # Recent turns with this person (relationship-context enrichment).
+        # Explicit None-check, not `or`: personRecentLimit has minimum=0 and
+        # "0 disables" is documented — `or 30` would silently rewrite a
+        # deliberate 0 to 30. A non-positive limit skips the lookup entirely
+        # (the operator turned relationship-context injection OFF).
+        limit_cfg = store.get("personRecentLimit")
+        person_recent_limit = int(limit_cfg) if limit_cfg is not None else 30
         recent_with_person: list = []
-        if effective_person_id != NIL_PERSON_ID:
+        if effective_person_id != NIL_PERSON_ID and person_recent_limit > 0:
             try:
                 invocation = await tool_runner.run(
                     new_call(TOOL_MEMORY_PERSON_RECENT),
                     ToolContext(
                         inputs={
                             "person_id": effective_person_id,
-                            "limit": int(store.get("personRecentLimit") or 30),
+                            "limit": person_recent_limit,
                         }
                     ),
                 )
@@ -317,18 +325,50 @@ class ConsciousnessLoop:
 
         history_for_drivers = turn.build_history(history, msg.content)
 
-        # NT no longer modulates the pass count (the plateau-stop gate
-        # replaces `modulated_max_passes` in a later increment); for now
-        # the deliberative thought runs to the configured cap. Temperature
-        # IS still NT-modulated (a parameter, not a limit).
-        max_passes = int(store.get("defaultMaxPasses") or 3)
-        agreement_threshold = float(store.get("agreementThreshold") or 0.5)
+        # Deliberation depth is owned by the plateau-stop gate (a noisy
+        # dopamine-RPE accumulator), NOT a fixed pass count. `defaultMaxPasses`
+        # is the runaway cost fuse only. Temperature stays NT-modulated (a
+        # parameter, not a limit). `agreementThreshold` no longer terminates
+        # the loop — it survives only to (a) center the post-turn dopamine
+        # impulse and (b) key the calm-vs-stress GABA/cortisol impulse, both
+        # via build_observations below. It does NOT feed the voice register
+        # bands (those use absolute cutoffs; see voice.py::_agreement_directive).
+        # Explicit None-check: agreementThreshold has minimum=0.0, and a
+        # configured 0.0 ("treat every bout as settled") is meaningful — `or`
+        # would silently rewrite it to 0.5.
+        max_passes = int(store.get("defaultMaxPasses") or 8)
+        threshold_cfg = store.get("agreementThreshold")
+        agreement_threshold = float(threshold_cfg) if threshold_cfg is not None else 0.5
         temp_cfg = store.get("defaultTemperature")
         temperature = modulated_temperature(
             nt_at_start, float(temp_cfg) if temp_cfg is not None else None
         )
         max_tokens_cfg = store.get("defaultMaxTokens")
         max_tokens = int(max_tokens_cfg) if max_tokens_cfg is not None else None
+
+        # Build the plateau gate for this bout. Explicit None-checks (not
+        # `or`): a configured 0.0 is a MEANINGFUL value for these gains
+        # (e.g. disable the improvement/valence coupling or the noise), and
+        # `x or default` would silently treat 0.0 as unset. Seed: null in
+        # production (OS entropy → real stochasticity); a fixed int makes
+        # the noisy stop reproducible (tests / clamp-and-sample debugging).
+        def _gate_float(key: str, default: float) -> float:
+            value = store.get(key)
+            return float(value) if value is not None else default
+
+        seed_cfg = store.get("plateauSeed")
+        gate = BoutGate(
+            PlateauParams(
+                base_drift=_gate_float("plateauBaseDrift", 1.0),
+                rpe_gain=_gate_float("plateauRpeGain", 3.0),
+                valence_gain=_gate_float("plateauValenceGain", 0.5),
+                # 0.1, not 0.0: "noise on (low)" is the locked default, so the
+                # code-level fallback must match the config default — a missing
+                # key must not silently make the gate deterministic.
+                noise_sigma=_gate_float("plateauNoiseSigma", 0.1),
+            ),
+            random.Random(int(seed_cfg) if seed_cfg is not None else None),
+        )
 
         # THINK — the deliberative flavor of a thought is the bicameral pair.
         try:
@@ -338,7 +378,7 @@ class ConsciousnessLoop:
                 drivers=drivers,
                 nt_state=nt_at_start,
                 max_passes=max_passes,
-                agreement_threshold=agreement_threshold,
+                gate=gate,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 scorer=scorer,
@@ -351,9 +391,12 @@ class ConsciousnessLoop:
         for pass_record in outcome.passes:
             self._publish("thought", pass_record.model_dump(mode="json", exclude_none=True))
 
-        # GATE — deterministic for 2a: a message that produced a
-        # deliberation is spoken. The NT-valence accumulator replaces this.
-        self._publish_gate("speak", focus=new_focus)
+        # GATE — the action SELECTOR is still deterministic for now (a
+        # message that produced a deliberation is spoken); the NT-valence
+        # *action* gate is the next increment. But the decision now carries
+        # Eugene's live affect (net valence at decision time) on
+        # anticipatedValence, so the stream shows how it feels as it acts.
+        self._publish_gate("speak", focus=new_focus, anticipated_valence=net_valence(nt_at_start))
 
         # SPEAK — the voice pass IS the speech effector.
         voice_driver = turn.resolve_voice_driver(drivers, store.get("voiceDriver"))
@@ -449,6 +492,10 @@ class ConsciousnessLoop:
     def _publish(self, event_type: str, data: dict) -> None:
         self._broker.publish(event_type, data)
 
-    def _publish_gate(self, action: str, *, focus: str | None) -> None:
-        decision = GateDecision.model_validate({"action": action, "focus": focus})
+    def _publish_gate(
+        self, action: str, *, focus: str | None, anticipated_valence: float | None = None
+    ) -> None:
+        decision = GateDecision.model_validate(
+            {"action": action, "focus": focus, "anticipatedValence": anticipated_valence}
+        )
         self._broker.publish("gate_decision", decision.model_dump(mode="json", exclude_none=True))

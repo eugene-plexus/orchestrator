@@ -5,14 +5,17 @@ For each turn:
 1. Build the prompt from conversation history + the new user message.
 2. Send to all configured drivers in parallel.
 3. Score corpus-callosum agreement on their outputs.
-4. If agreement >= threshold, terminate and emit a blended response.
-5. Otherwise, append every driver's output + a re-think prompt and run
-   another pass, up to `max_passes`.
+4. Feed that agreement to the `BoutGate` (a noisy dopamine-RPE plateau
+   accumulator): while thinking keeps improving the agreement the bout
+   continues; once improvement plateaus — converged OR out of angles —
+   the gate stops and the loop emits a blended response. See
+   `plateau.py`.
+5. `max_passes` is now only a runaway COST FUSE (accounting, like a
+   token ceiling); a healthy bout ends on the plateau well before it.
 
-v0.1 keeps this *deliberately mechanical*: there's no smart prompting
-between passes, no per-driver prompt variation, no NT modulation. The
-goal is to validate the cross-vendor architecture; meaningful pass-policy
-work comes after we have data.
+The bout-end is NT-driven (the plateau reads live `net_valence`) and
+stochastic (the gate carries low Gaussian noise) — no fixed agreement
+threshold and no fixed pass count act as the terminator.
 
 v0.1 also pins the loop at *exactly two* drivers — the agreement scoring
 and blend functions are pairwise. v0.2+ generalizes to N (with a real
@@ -37,6 +40,8 @@ from .._generated.models import (
 )
 from ..hemisphere_client import HemisphereClient
 from .callosum import AgreementScorer, blend
+from .nt import net_valence
+from .plateau import BoutGate
 
 log = logging.getLogger(__name__)
 
@@ -192,7 +197,7 @@ async def run_bicameral_loop(
     drivers: list[HemisphereClient],
     nt_state: NTState,
     max_passes: int,
-    agreement_threshold: float,
+    gate: BoutGate,
     temperature: float | None,
     max_tokens: int | None,
     scorer: AgreementScorer,
@@ -210,9 +215,15 @@ async def run_bicameral_loop(
 
     `temperature` and `max_tokens` are applied to every `GenerateRequest`
     built here. The orchestrator owns LLM-output-affecting parameters; the
-    driver does not substitute defaults of its own. In v0.2+ these will be
-    derived per-pass from `nt_state` instead of being supplied as flat
-    arguments — until then the caller passes the configured baseline.
+    driver does not substitute defaults of its own.
+
+    `gate` is the per-bout `BoutGate` (constructed fresh per turn by the
+    caller, with a seeded RNG). It decides when deliberation has plateaued.
+    `nt_state` feeds the gate's valence brake via `net_valence`, computed
+    once here (NT does not change within a bout). `max_passes` is the
+    runaway cost fuse — the loop never exceeds it, but a healthy bout ends
+    on the plateau first; hitting the fuse yields `Decision.cap_reached`
+    and a WARN.
 
     `drivers` carries the operator-supplied driver names; each emitted
     `Message` is stamped with `driverName` so the UI and downstream
@@ -231,6 +242,11 @@ async def run_bicameral_loop(
                 f"system_prompts is missing an entry for driver {driver.name!r}; "
                 f"got keys {sorted(system_prompts)}"
             )
+
+    # Live net affective valence — the gate's bout-length brake. Constant
+    # within a bout (NT is single-writer: only the post-turn observe tick
+    # mutates it), so compute once and feed every pass.
+    bout_valence = net_valence(nt_state)
 
     passes: list[PassRecord] = []
     pass_latencies_ms: list[int] = []
@@ -337,19 +353,32 @@ async def run_bicameral_loop(
         )
 
         score = scorer.score(left_resp.content, right_resp.content)
+        # Feed agreement to the plateau gate. `plateaued` fires once
+        # improvement fades (convergence OR out-of-angles); `is_last_pass`
+        # is only the runaway cost fuse.
+        step = gate.observe(score=score, valence=bout_valence)
+        plateaued = step.should_stop
         is_last_pass = pass_index == max_passes - 1
-        agreed = score >= agreement_threshold
         log.debug(
-            "  pass %d callosum agreement=%.3f threshold=%.2f agreed=%s is_last=%s",
+            "  pass %d callosum agreement=%.3f improvement=%s accumulator=%.3f "
+            "plateaued=%s is_last=%s",
             pass_index,
             score,
-            agreement_threshold,
-            agreed,
+            f"{step.improvement:+.3f}" if step.improvement is not None else "n/a",
+            step.accumulator,
+            plateaued,
             is_last_pass,
         )
 
-        if agreed or is_last_pass:
-            decision = Decision.terminate if agreed else Decision.cap_reached
+        if plateaued or is_last_pass:
+            decision = Decision.terminate if plateaued else Decision.cap_reached
+            if not plateaued:
+                log.warning(
+                    "bicameral bout hit the cost fuse (max_passes=%d) without a "
+                    "dopamine plateau — a healthy bout should settle first; check "
+                    "the plateau* knobs if this recurs",
+                    max_passes,
+                )
             blended_text = blend(left_resp.content, right_resp.content)
             blended_msg = Message(
                 role=Role.assistant,

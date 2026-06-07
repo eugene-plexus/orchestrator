@@ -57,6 +57,7 @@ class FakeHemisphereClient:
         self.model_id = model_id
         self.responses: list[str] = []
         """FIFO queue of canned responses; tests assign before calling the route."""
+        self._last_response: str | None = None
         self.calls: list[GenerateRequest] = []
         self.info_error: Exception | None = None
         self.generate_error: Exception | None = None
@@ -75,7 +76,19 @@ class FakeHemisphereClient:
         self.calls.append(request)
         if self.generate_error is not None:
             raise self.generate_error
-        text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
+        # Repeat the last scripted response once the queue drains, rather
+        # than emitting a distinct sentinel. Under the plateau-stop a bout
+        # may run more passes than a test scripted; repeating keeps the
+        # cross-hemisphere agreement trajectory stable (the hemisphere
+        # "keeps saying the same thing") instead of injecting a spurious
+        # agreement swing on the extra passes.
+        if self.responses:
+            self._last_response = self.responses.pop(0)
+        text = (
+            self._last_response
+            if self._last_response is not None
+            else f"<{self.name} default response>"
+        )
         return GenerateResponse(
             content=text,
             finishReason=FinishReason.stop,
@@ -171,6 +184,12 @@ def build_loop_app(
     app = create_app(settings=settings)
     store = ConfigStore(settings.config_file)
     store.load()
+    # Pin the plateau gate's RNG so loop-integration tests are reproducible
+    # while still exercising the real (noise-on) code path — "seed the RNG,
+    # don't disable the noise." Tests that need a specific stop behavior
+    # override the plateau* values; the dedicated BoutGate / clamp-and-sample
+    # tests construct gates directly with their own seeds.
+    store._values["plateauSeed"] = 12345
     app.state.config_store = store
     app.state.safe_mode = False
     app.state.nt_state = neutral_state()
