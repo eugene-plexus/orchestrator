@@ -184,12 +184,15 @@ def build_loop_app(
     app = create_app(settings=settings)
     store = ConfigStore(settings.config_file)
     store.load()
-    # Pin the plateau gate's RNG so loop-integration tests are reproducible
-    # while still exercising the real (noise-on) code path — "seed the RNG,
-    # don't disable the noise." Tests that need a specific stop behavior
-    # override the plateau* values; the dedicated BoutGate / clamp-and-sample
-    # tests construct gates directly with their own seeds.
+    # Pin both gate RNGs so loop-integration tests are reproducible while
+    # still exercising the real (noise-on) code path — "seed the RNG, don't
+    # disable the noise." Tests that need a specific stop / silence behavior
+    # override the plateau* / action* values; the dedicated BoutGate /
+    # action-selector tests construct their own seeded RNGs. With the default
+    # action params at neutral NT, P(speak)≈0.98, so a pinned-seed turn
+    # speaks — existing loop tests still see a `speech` event.
     store._values["plateauSeed"] = 12345
+    store._values["actionSeed"] = 12345
     app.state.config_store = store
     app.state.safe_mode = False
     app.state.nt_state = neutral_state()

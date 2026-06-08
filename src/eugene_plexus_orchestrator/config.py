@@ -344,6 +344,89 @@ FIELDS: list[ConfigField] = [
         default=None,
         required=False,
     ),
+    # -- Action gate: the speak-vs-stay-silent selector that runs once a
+    # bout settles. A softmax over each action's anticipated value; silence
+    # is emergent and NT-gated, never a hard rule. See bicameral/action.py.
+    ConfigField(
+        key="actionResponseDrive",
+        label="Response drive",
+        description=(
+            "How strongly being addressed pulls Eugene toward replying — the "
+            "innate 'someone spoke to me' urge, before mood is factored in. "
+            "This is the value SPEAK starts with that staying silent has to "
+            "beat. Higher = Eugene almost always answers; lower = he replies "
+            "only when he also feels like engaging. It is a strong drive, not "
+            "a rule: a bad enough mood can still tip him to silence."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=0.6,
+        minimum=0.0,
+        maximum=2.0,
+    ),
+    ConfigField(
+        key="actionEngagementGain",
+        label="Engagement gain",
+        description=(
+            "How strongly Eugene's mood (net NT valence) biases the choice to "
+            "speak vs stay silent. Positive = feeling good makes him more "
+            "eager to engage and feeling bad (stress) makes him withdraw into "
+            "silence — this is what makes staying quiet emerge from his state "
+            "rather than being a fixed rule. 0 = mood doesn't affect whether "
+            "he replies (he answers purely on the response drive)."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=0.5,
+        minimum=-2.0,
+        maximum=2.0,
+    ),
+    ConfigField(
+        key="actionIdleFloor",
+        label="Silence floor",
+        description=(
+            "The constant appeal of staying silent — the bar replying must "
+            "clear. 0.0 means a neutral-mood address is almost always "
+            "answered. Raise it to make Eugene more reticent across the "
+            "board (silent unless he clearly wants to engage); lower it "
+            "(negative) to make him chattier."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=0.0,
+        minimum=-2.0,
+        maximum=2.0,
+    ),
+    ConfigField(
+        key="actionSelectionTemperature",
+        label="Action selection temperature",
+        description=(
+            "Randomness of the speak-vs-silent choice. Low = decisive (Eugene "
+            "almost always takes the higher-value action); high = more of a "
+            "coin-flip near the margin. Like the plateau noise, the "
+            "stochasticity is real — two identical situations can resolve "
+            "differently — not a bug to tune away."
+        ),
+        category="gate",
+        valueType=ConfigValueType.number,
+        default=0.15,
+        minimum=0.01,
+        maximum=2.0,
+    ),
+    ConfigField(
+        key="actionSeed",
+        label="Action gate RNG seed (debug)",
+        description=(
+            "Optional fixed seed for the speak-vs-silent sampler. Leave blank "
+            "in normal operation — Eugene draws fresh entropy each decision. "
+            "Set an integer only to make the choice reproducible for "
+            "debugging."
+        ),
+        category="gate",
+        valueType=ConfigValueType.integer,
+        default=None,
+        required=False,
+    ),
     ConfigField(
         key="crossPassFraming",
         label="Cross-pass framing",

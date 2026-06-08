@@ -6,15 +6,16 @@ onto its queue (`POST /v1/events`) and subscribe to its observability
 stream (`GET /v1/stream/consciousness`). Because exactly one task mutates
 cognitive state, there is no locking anywhere in the cognition path.
 
-**This first increment (M2 slice 2) is behavior-preserving-ish:** on a
-`message` event the loop reproduces the v0.2 turn — recall → per-driver
-prompts → bicameral deliberation → voice pass → NT tick → persist — but
-restructured as fire-and-forget with the reply leaving asynchronously as
-an `EfferentSpeechAct`, and every step published to the consciousness
-stream. The action gate is DETERMINISTIC here (a message that produced a
-deliberation is spoken). The real NT-valence gate, adenosine/sleep,
-plateau-stop, presence, and multi-focus salience switching layer on in
-later increments — see `docs/design/m1-continuous-runtime.md` in `specs`.
+**Cognition flow** on a `message` event: recall → per-driver prompts →
+bicameral deliberation (depth owned by the plateau-stop gate, not a fixed
+pass count) → NT tick → the action gate elects *speak* or *stay-silent* on
+anticipated net NT valence → (if speaking) voice pass → persist → emit an
+`EfferentSpeechAct`. The whole thing is fire-and-forget — no caller waits
+on a response; the reply leaves asynchronously as the speech act — and
+every step publishes to the consciousness stream. Adenosine/sleep,
+presence, self-initiated (unaddressed) speech, and multi-focus salience
+switching layer on in later increments — see
+`docs/design/m1-continuous-runtime.md` in `specs`.
 
 Errors NEVER crash the loop: there is no caller waiting on an HTTP
 response, so a failed recall / deliberation / voice pass is logged (and,
@@ -39,7 +40,9 @@ from .._generated.models import (
     Message,
     NTState,
     Role,
+    ToolInvocationRecord,
 )
+from ..bicameral.action import Action, ActionPolicyParams, select_action
 from ..bicameral.loop import run_bicameral_loop
 from ..bicameral.nt import modulated_temperature, net_valence
 from ..bicameral.plateau import BoutGate, PlateauParams
@@ -336,7 +339,8 @@ class ConsciousnessLoop:
         # Explicit None-check: agreementThreshold has minimum=0.0, and a
         # configured 0.0 ("treat every bout as settled") is meaningful — `or`
         # would silently rewrite it to 0.5.
-        max_passes = int(store.get("defaultMaxPasses") or 8)
+        max_passes_cfg = store.get("defaultMaxPasses")
+        max_passes = int(max_passes_cfg) if max_passes_cfg is not None else 8
         threshold_cfg = store.get("agreementThreshold")
         agreement_threshold = float(threshold_cfg) if threshold_cfg is not None else 0.5
         temp_cfg = store.get("defaultTemperature")
@@ -391,14 +395,74 @@ class ConsciousnessLoop:
         for pass_record in outcome.passes:
             self._publish("thought", pass_record.model_dump(mode="json", exclude_none=True))
 
-        # GATE — the action SELECTOR is still deterministic for now (a
-        # message that produced a deliberation is spoken); the NT-valence
-        # *action* gate is the next increment. But the decision now carries
-        # Eugene's live affect (net valence at decision time) on
-        # anticipatedValence, so the stream shows how it feels as it acts.
-        self._publish_gate("speak", focus=new_focus, anticipated_valence=net_valence(nt_at_start))
+        # EVOLVE NT from the bout's observations (the `internal` tool) BEFORE
+        # the gate — Eugene thought either way, so his affect updates whether
+        # or not he ends up speaking, and the action gate must read this
+        # POST-bout state to decide how he feels having thought it through. A
+        # failure here must NOT abort the turn — fall back to the pre-turn
+        # state; the gate (and any reply) still proceed. NTState carries a
+        # required `lastUpdated` datetime, so the publish uses mode="json"
+        # like every other event — without it `json.dumps` in the SSE route
+        # would raise and kill the subscriber's stream.
+        observations = turn.build_observations(outcome, agreement_threshold)
+        nt_at_end: NTState = nt_at_start
+        try:
+            nt_invocation = await tool_runner.run(
+                new_call(TOOL_NT_OBSERVE),
+                ToolContext(inputs={"state": nt_at_start, "observations": observations}),
+            )
+            nt_at_end = nt_invocation.payload
+            app.state.nt_state = nt_at_end
+            self._publish("nt_update", nt_at_end.model_dump(mode="json"))
+        except Exception:
+            log.exception(
+                "NT observe failed for message %s — keeping prior state, gate still decides",
+                event.eventId,
+            )
 
-        # SPEAK — the voice pass IS the speech effector.
+        # GATE — the action SELECTOR: speak vs stay silent, chosen by
+        # anticipated net NT valence (a seedable softmax sample). Being
+        # addressed is a strong innate drive toward SPEAK, but a sufficiently
+        # aversive post-bout state can tip Eugene to silence — emergent, not
+        # legislated; there is no "addressed → always reply" rule. `addressed`
+        # is True here because a message captured his attention; self-
+        # initiated speech (addressed=False, idle mind-wandering) is a later
+        # increment. THINK_MORE / SWITCH / SLEEP join the candidate set the
+        # same way without changing the mechanism.
+        action_seed = store.get("actionSeed")
+        choice = select_action(
+            valence=net_valence(nt_at_end),
+            addressed=True,
+            params=ActionPolicyParams(
+                response_drive=_gate_float("actionResponseDrive", 0.6),
+                engagement_gain=_gate_float("actionEngagementGain", 0.5),
+                idle_floor=_gate_float("actionIdleFloor", 0.0),
+                selection_temperature=_gate_float("actionSelectionTemperature", 0.15),
+            ),
+            rng=random.Random(int(action_seed) if action_seed is not None else None),
+        )
+        self._publish_gate(
+            choice.action.value, focus=new_focus, anticipated_valence=choice.anticipated_valence
+        )
+
+        if choice.action is not Action.SPEAK:
+            # Silence is a real outcome: Eugene thought, his NT evolved, and
+            # he chose not to emit. No voice pass, no reply persisted, no
+            # EfferentSpeechAct. The perception + NT-evolve tools still ran,
+            # so surface their trace for the observability stream.
+            log.info(
+                "gate chose %s over speak (valence=%.3f, p_speak=%.2f) for message %s — silent",
+                choice.action.value,
+                net_valence(nt_at_end),
+                choice.probabilities.get(Action.SPEAK, 0.0),
+                event.eventId,
+            )
+            self._flush_trace(trace)
+            return
+
+        # SPEAK — the voice pass IS the speech effector. (Voice register reads
+        # nt_at_start — Eugene's affect entering the turn — unchanged from
+        # v0.2; unifying it onto nt_at_end is a clean follow-up.)
         voice_driver = turn.resolve_voice_driver(drivers, store.get("voiceDriver"))
         voice_temp_cfg = store.get("voiceTemperature")
         voice_temperature = float(voice_temp_cfg) if voice_temp_cfg is not None else temperature
@@ -422,29 +486,6 @@ class ConsciousnessLoop:
         except (HemisphereDriverError, httpx.HTTPError) as e:
             log.warning("voice pass failed for message %s: %s — no reply", event.eventId, e)
             return
-
-        # Evolve NT from the turn's observations (the `internal` tool). A
-        # failure here must NOT discard the already-composed reply — fall
-        # back to the pre-turn state and still speak (the same principle the
-        # reply-persist step below documents). NTState carries a required
-        # `lastUpdated` datetime, so the publish uses mode="json" like every
-        # other event — without it `json.dumps` in the SSE route would raise
-        # and kill the subscriber's stream.
-        observations = turn.build_observations(outcome, agreement_threshold)
-        nt_at_end: NTState = nt_at_start
-        try:
-            nt_invocation = await tool_runner.run(
-                new_call(TOOL_NT_OBSERVE),
-                ToolContext(inputs={"state": nt_at_start, "observations": observations}),
-            )
-            nt_at_end = nt_invocation.payload
-            app.state.nt_state = nt_at_end
-            self._publish("nt_update", nt_at_end.model_dump(mode="json"))
-        except Exception:
-            log.exception(
-                "NT observe failed for message %s — keeping prior state, still replying",
-                event.eventId,
-            )
 
         final_message = voice_outcome.output
 
@@ -471,8 +512,7 @@ class ConsciousnessLoop:
 
         # Surface the turn's tool trace on the stream (the M0.5 debug lens,
         # now live rather than bundled into a response).
-        for record in trace:
-            self._publish("tool_call", record.model_dump(mode="json", exclude_none=True))
+        self._flush_trace(trace)
 
         # SPEAK effector — emit the utterance. Destination mirrors the
         # afferent source; `inResponseTo` correlates it to the event. For
@@ -491,6 +531,16 @@ class ConsciousnessLoop:
 
     def _publish(self, event_type: str, data: dict) -> None:
         self._broker.publish(event_type, data)
+
+    def _flush_trace(self, trace: list[ToolInvocationRecord]) -> None:
+        """Publish the turn's accumulated tool-invocation records.
+
+        Called on BOTH the speak and the silent path — perception and NT
+        evolution ran regardless of whether Eugene chose to reply, so their
+        trace belongs on the stream either way.
+        """
+        for record in trace:
+            self._publish("tool_call", record.model_dump(mode="json", exclude_none=True))
 
     def _publish_gate(
         self, action: str, *, focus: str | None, anticipated_valence: float | None = None
